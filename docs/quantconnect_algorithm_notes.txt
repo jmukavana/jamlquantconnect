@@ -1,0 +1,3585 @@
+================================================================================
+QUANTCONNECT ALGORITHM DEVELOPMENT NOTES
+Focus: Reliable | Scalable | Effective | Cost-Effective | Profitable
+================================================================================
+Source: Quantconnect-Writing-Algorithms-Python.pdf
+Generated: 2026-05-03
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1.  Core Architecture & Engine
+2.  Algorithm Structure (Reliable)
+3.  Data Handling & Subscriptions (Reliable)
+4.  Universe Selection (Scalable)
+5.  Portfolio & Orders (Cost-Effective)
+6.  Reality Modeling - Fees, Slippage, Fills (Cost-Effective)
+7.  Indicators & Signals (Effective)
+8.  Scheduling (Reliable, Scalable)
+9.  Historical Data & Warm-Up (Reliable)
+10. Consolidators (Effective)
+11. Strategy Patterns (Profitable)
+12. Equity Options (Profitable)
+13. Corporate Actions (Reliable)
+14. Machine Learning Integration (Effective)
+15. Performance Optimization (Scalable)
+16. Algorithm Framework - Modular Pipeline (Scalable)
+17. Risk Management (Reliable, Profitable)
+18. Biases to Avoid (Profitable)
+19. Performance Metrics (Profitable)
+20. Live Trading Considerations (Reliable)
+21. Key Code Patterns & Templates
+22. Crypto Data — Subscriptions & Live Data Collection
+23. Option Greeks as LEAN Indicators
+24. Forex Data — Subscriptions & Handling
+25. Futures Data — Subscriptions & Handling
+26. Future Options — Subscriptions & Strategies
+27. Additional Important Algorithm Patterns
+28. Order Management — Full Control of Trade Execution
+29. Portfolio Management — Positions, Allocation & Rebalancing
+30. Risk Management — Drawdown Controls & Position Limits
+31. Strategy Management — Algorithm Framework Deep Dive
+32. Supply & Demand Zones — Price Action Strategy
+33. Wyckoff Method — Accumulation, Distribution & Market Phases
+
+
+================================================================================
+1. CORE ARCHITECTURE & ENGINE
+================================================================================
+
+ENGINE: LEAN (open-source, C# core, Python 3.11 via Python.Net)
+- All algorithms subclass QCAlgorithm
+- Event-driven streaming: data arrives in strict time order
+- Time Frontier prevents look-ahead bias - you only see data up to current time
+- Timeslice/Slice: all data at a moment bundled into one Slice object
+
+SYMBOL OBJECTS (CRITICAL FOR RELIABILITY):
+- Symbol objects are permanent identifiers that persist even when tickers change
+- Always store and use Symbol objects, NOT ticker strings
+- LEAN uses map files to track ticker changes automatically
+
+SECURITY OBJECT:
+- Models an individual asset with price, holdings, reality models, market hours
+- Access via self.securities[symbol]
+- Properties: price, holdings, is_tradable, exchange, symbol_properties
+
+DATA FORMATS:
+- TradeBar: OHLCV period data (open, high, low, close, volume)
+- QuoteBar: bid/ask spread data (more accurate for fills)
+- Tick: point-in-time trade or quote (most granular, most overhead)
+
+RESOLUTIONS (choose carefully for cost/performance balance):
+- TICK: Maximum granularity, very high memory/CPU cost
+- SECOND: High frequency, significant overhead
+- MINUTE: Default for equity - good balance of detail vs cost
+- HOUR: Good for daily rebalancing strategies
+- DAILY: Lowest overhead, best for fundamental/long-term strategies
+
+FILL FORWARD (default=True):
+- When True: uses last known price when no new data point is available
+- Prevents NaN gaps in indicators
+- Disable only when you specifically need to detect missing data
+
+
+================================================================================
+2. ALGORITHM STRUCTURE (RELIABLE)
+================================================================================
+
+BASIC TEMPLATE:
+```python
+class MyAlgorithm(QCAlgorithm):
+    def initialize(self) -> None:
+        self.set_start_date(2020, 1, 1)
+        self.set_end_date(2024, 12, 31)
+        self.set_cash(100000)
+        self.set_brokerage_model(BrokerageModel.INTERACTIVE_BROKERS_BROKERAGE)
+        self._symbol = self.add_equity("SPY", Resolution.DAILY).symbol
+        self._sma = self.sma(self._symbol, 20)
+        self.warm_up_indicator(self._symbol, self._sma)
+
+    def on_data(self, slice: Slice) -> None:
+        if self.is_warming_up: return
+        bar = slice.bars.get(self._symbol)
+        if bar is None or not self._sma.is_ready: return
+        # trading logic here
+
+    def on_order_event(self, order_event: OrderEvent) -> None:
+        # handle fills, cancellations, etc.
+        pass
+```
+
+KEY EVENT HANDLERS:
+- initialize(): One-time setup. Add securities, indicators, schedules
+- on_data(slice): Called every time step. Main trading logic
+- on_order_event(order_event): Called when order status changes
+- on_securities_changed(changes): Called when universe changes
+- on_splits(splits): Handle stock splits
+- on_dividends(dividends): Handle dividend payments
+- on_symbol_changed_events(events): Handle ticker changes
+- on_delistings(delistings): Handle delisted stocks
+
+WARM-UP PATTERN (CRITICAL for reliability):
+```python
+def initialize(self):
+    self.set_warm_up(20, Resolution.DAILY)  # or by indicator
+    self.warm_up_indicator(self._symbol, self._sma)
+
+def on_data(self, slice):
+    if self.is_warming_up: return  # ALWAYS check this first
+    if not self._sma.is_ready: return  # ALWAYS check indicator readiness
+```
+
+ASYNCHRONOUS UNIVERSE UPDATES (improve performance):
+```python
+self.universe_settings.asynchronous = True  # run universe selection async
+```
+
+
+================================================================================
+3. DATA HANDLING & SUBSCRIPTIONS (RELIABLE)
+================================================================================
+
+ADDING SECURITIES:
+```python
+# Equity
+equity = self.add_equity("AAPL", Resolution.DAILY)
+symbol = equity.symbol
+
+# With extended hours
+equity = self.add_equity("SPY", Resolution.MINUTE, extended_market_hours=True)
+
+# With data normalization (use RAW for options compatibility)
+equity = self.add_equity("SPY", data_normalization_mode=DataNormalizationMode.RAW)
+```
+
+DATA NORMALIZATION MODES:
+- ADJUSTED: Adjusts for splits and dividends (default) - use for pure price analysis
+- RAW: No adjustments - REQUIRED for options trading (strike price comparability)
+- SPLIT_ADJUSTED: Only split-adjusted
+- TOTAL_RETURN: Dividends reinvested
+- SCALED_RAW: For resetting indicators after corporate actions
+
+ACCESSING DATA IN on_data:
+```python
+# Safe access (returns None if not present)
+bar = slice.bars.get(self._symbol)
+quote = slice.quote_bars.get(self._symbol)
+
+# Direct access (throws if not present - use only after checking)
+if self._symbol in slice.bars:
+    bar = slice.bars[self._symbol]
+```
+
+SUSPICIOUS TICKS (be aware of for tick data strategies):
+- Ticks occurring outside best bid/ask are flagged suspicious
+- Ticks far from current market price are flagged
+- Dark pool ticks, rolled-back ticks, late-reported ticks are flagged
+- Suspicious ticks still appear in data - filter them if using tick resolution
+
+CORPORATE ACTIONS (handle for reliability):
+```python
+def on_splits(self, splits: Splits) -> None:
+    split = splits.get(self._symbol)
+    if split and split.type == SplitType.SPLIT_OCCURRED:
+        # Reset and re-warm indicators after split
+        self._ema.reset()
+        history = self.history[TradeBar](
+            self._symbol, self._ema.warm_up_period,
+            data_normalization_mode=DataNormalizationMode.SCALED_RAW)
+        for bar in history:
+            self._ema.update(bar.end_time, bar.close)
+
+def on_dividends(self, dividends: Dividends) -> None:
+    dividend = dividends.get(self._symbol)
+    if dividend:
+        # Reinvest dividends
+        total = dividends[self._symbol].distribution * self.portfolio[self._symbol].quantity
+        qty = np.floor(total / self._symbol.price)
+        if qty: self.market_order(self._symbol, qty)
+
+def on_delistings(self, delistings: Delistings) -> None:
+    delisting = delistings.get(self._symbol)
+    if delisting and delisting.type == DelistingType.WARNING:
+        # Exit before forced liquidation
+        qty = self.portfolio[self._symbol].quantity
+        if qty != 0:
+            self.market_on_open_order(self._symbol, -qty)
+```
+
+MARKET HOURS AWARENESS:
+- US Equity regular hours: 9:30 AM - 4:00 PM ET
+- Corporate actions arrive at 6/7 AM ET in live trading
+- Use self.exchange_hours to check if market is open
+
+
+================================================================================
+4. UNIVERSE SELECTION (SCALABLE)
+================================================================================
+
+FUNDAMENTAL UNIVERSE (most powerful for scalability):
+```python
+def initialize(self):
+    self.universe_settings.resolution = Resolution.DAILY
+    self.universe_settings.asynchronous = True  # run in background
+    self._universe = self.add_universe(self._fundamental_filter)
+    # Rebalance schedule
+    self.schedule.on(self.date_rules.month_start(),
+        self.time_rules.after_market_open("SPY", 30), self._rebalance)
+
+def _fundamental_filter(self, fundamental: List[Fundamental]) -> List[Symbol]:
+    # Filter for quality stocks with sufficient liquidity
+    filtered = [
+        x for x in fundamental
+        if x.has_fundamental_data
+        and x.price > 5                    # avoid penny stocks
+        and x.dollar_volume > 10_000_000   # minimum liquidity
+        and x.market_cap > 1_000_000_000   # large/mid cap only
+    ]
+    # Return top N by dollar volume (survivorship bias warning: use point-in-time data)
+    return [x.symbol for x in sorted(filtered,
+        key=lambda x: x.dollar_volume, reverse=True)[:500]]
+```
+
+FUNDAMENTAL DATA PROPERTIES (Morningstar):
+- x.price, x.dollar_volume, x.market_cap
+- x.has_fundamental_data (check before accessing fundamentals)
+- x.valuation_ratios.pe_ratio, x.valuation_ratios.pb_ratio
+- x.asset_classification.morningstar_sector_code
+- x.asset_classification.morningstar_industry_code
+- x.financial_statements.file_date (for earnings event detection)
+- MorningstarSectorCode.TECHNOLOGY, .FINANCIAL_SERVICES, .HEALTHCARE, etc.
+
+UNIVERSE CHANGED EVENT:
+```python
+def on_securities_changed(self, changes: SecurityChanges) -> None:
+    for security in changes.added_securities:
+        # Initialize indicators for new securities
+        security.ema = self.ema(security.symbol, 20)
+    for security in changes.removed_securities:
+        # Deregister indicators, liquidate positions
+        self.deregister_indicator(security.ema)
+        self.liquidate(security.symbol)
+```
+
+SECTOR DIVERSIFICATION (reduce concentration risk):
+```python
+def _rebalance(self):
+    symbols_by_sector = {}
+    for symbol in self._universe.selected:
+        equity = self.securities[symbol]
+        if not equity.price: continue
+        sector = equity.fundamentals.asset_classification.morningstar_sector_code
+        symbols_by_sector.setdefault(sector, []).append(symbol)
+
+    targets = []
+    sector_count = len(symbols_by_sector)
+    for symbols in symbols_by_sector.values():
+        weight = 1 / sector_count / len(symbols)
+        targets.extend([PortfolioTarget(s, weight) for s in symbols])
+    self.set_holdings(targets, liquidate_existing_holdings=True)
+```
+
+ETF CONSTITUENT UNIVERSE (focused, liquid):
+```python
+self.add_universe(self.universe.etf("SPY", Market.USA,
+    lambda constituents: [c.symbol for c in constituents if c.weight > 0.001]))
+```
+
+UNIVERSE SETTINGS:
+```python
+self.universe_settings.resolution = Resolution.DAILY
+self.universe_settings.minimum_time_in_universe = timedelta(days=7)  # avoid churning
+self.universe_settings.fill_forward = True
+```
+
+
+================================================================================
+5. PORTFOLIO & ORDERS (COST-EFFECTIVE)
+================================================================================
+
+ORDER TYPES (choose for cost-effectiveness):
+- Market Order: Immediate fill, worst price - use sparingly
+- Limit Order: Fixed price, may not fill - best for cost control
+- Market On Open (MOO): Fills at official open price - good for rebalancing
+- Market On Close (MOC): Fills at official close price
+- Stop Market: Trigger price then market - for stop losses
+- Stop Limit: Trigger price then limit - safer stop losses
+- Trailing Stop: Dynamic stop loss
+
+```python
+# Most common order patterns
+self.market_order(symbol, quantity)
+self.limit_order(symbol, quantity, limit_price)
+self.market_on_open_order(symbol, quantity)
+self.market_on_close_order(symbol, quantity)
+
+# Target-based (PREFERRED - handles sizing automatically)
+self.set_holdings(symbol, 0.5)       # 50% of portfolio
+self.set_holdings(targets, liquidate_existing_holdings=True)  # rebalance list
+self.liquidate(symbol)               # close position
+
+# Calculate quantity without placing order
+qty = self.calculate_order_quantity(symbol, 0.1)  # 10% weight
+```
+
+PORTFOLIO ACCESS:
+```python
+# Holdings
+holding = self.portfolio[symbol]
+holding.invested          # bool: have a position
+holding.is_long           # bool
+holding.is_short          # bool
+holding.quantity          # shares held
+holding.average_price     # cost basis
+holding.unrealized_profit # current P&L
+holding.total_sale_value  # market value
+
+# Portfolio-level
+self.portfolio.total_portfolio_value
+self.portfolio.cash
+self.portfolio.total_unrealized_profit
+self.portfolio.margin_remaining
+```
+
+AVOID OVER-TRADING (cost-effectiveness):
+```python
+# Only trade if not already in position
+if not self.portfolio[symbol].invested:
+    self.set_holdings(symbol, 0.5)
+
+# Only trade if position size deviates significantly
+current_weight = self.portfolio[symbol].holdings_value / self.portfolio.total_portfolio_value
+target_weight = 0.05
+if abs(current_weight - target_weight) > 0.01:  # 1% threshold
+    self.set_holdings(symbol, target_weight)
+```
+
+ORDER MANAGEMENT:
+```python
+def on_order_event(self, order_event: OrderEvent) -> None:
+    if order_event.status == OrderStatus.FILLED:
+        self.log(f"Filled: {order_event.symbol} qty={order_event.fill_quantity} price={order_event.fill_price}")
+    elif order_event.status == OrderStatus.CANCELED:
+        # Handle symbol changed events - resubmit with new symbol
+        ticket = self.transactions.get_order_ticket(order_event.order_id)
+        if "symbol changed event" in ticket.tag:
+            self.transactions.add_order(ticket.submit_request)
+
+# Cancel open orders
+self.transactions.cancel_open_orders(symbol)
+
+# Update existing order
+ticket = self.limit_order(symbol, qty, price)
+ticket.update_limit_price(new_price)
+```
+
+SHORT SELLING:
+```python
+# Model short availability realistically (CRITICAL for backtesting accuracy)
+security = self.add_equity("SPY")
+security.set_shortable_provider(InteractiveBrokersShortableProvider())
+security.margin_interest_rate_model = ShortMarginInterestRateModel()
+
+# Get available short quantity before shorting
+shortable_qty = security.shortable_provider.shortable_quantity(symbol, self.time)
+quantity = max(self.calculate_order_quantity(symbol, -0.1), -shortable_qty if shortable_qty else 0)
+```
+
+
+================================================================================
+6. REALITY MODELING - FEES, SLIPPAGE, FILLS (COST-EFFECTIVE)
+================================================================================
+
+BROKERAGE MODEL (sets all defaults at once - ALWAYS SET THIS):
+```python
+def initialize(self):
+    # Match your actual broker for realistic backtesting
+    self.set_brokerage_model(BrokerageModel.INTERACTIVE_BROKERS_BROKERAGE)
+    # or
+    self.set_brokerage_model(AlpacaBrokerageModel())
+```
+
+TRANSACTION FEE MODELS:
+```python
+# Per-share fee
+security.set_fee_model(ConstantFeeModel(0))          # zero fees
+security.set_fee_model(InteractiveBrokersFeeModel())  # IB fees
+
+# Custom fee
+class MyFeeModel(FeeModelPythonWrapper):
+    def get_order_fee(self, parameters):
+        value = parameters.order.abs_quantity * parameters.security.price
+        return OrderFee(CashAmount(max(1.0, value * 0.001), "USD"))
+```
+
+SLIPPAGE MODELS:
+```python
+# Zero slippage (unrealistic - avoid in final backtests)
+security.set_slippage_model(NullSlippageModel())
+
+# Spread-based (recommended for realistic backtesting)
+security.set_slippage_model(SpreadSlippageModel())
+
+# Constant percentage
+security.set_slippage_model(ConstantSlippageModel(0.001))  # 0.1%
+```
+
+FILL MODELS:
+```python
+# Default - fills immediately at close price
+security.set_fill_model(ImmediateFillModel())
+
+# Volume-weighted - more realistic for large orders
+security.set_fill_model(VolumeWeightedAveragePriceFillModel())
+```
+
+LEVERAGE AND MARGIN:
+```python
+security.set_leverage(2.0)  # 2x leverage
+# LEAN models margin calls automatically
+# Monitor margin_remaining to avoid forced liquidation
+```
+
+
+================================================================================
+7. INDICATORS & SIGNALS (EFFECTIVE)
+================================================================================
+
+BUILT-IN INDICATORS (100+):
+```python
+# Trend
+sma = self.sma(symbol, 20)                              # Simple MA
+ema = self.ema(symbol, 20)                              # Exponential MA
+frama = self.frama(symbol, 16)                          # Fractal Adaptive MA
+
+# Momentum
+rsi = self.rsi(symbol, 14)                              # RSI
+macd = self.macd(symbol, 12, 26, 9)                    # MACD
+roc = self.roc(symbol, 1)                               # Rate of Change
+stoch = self.sto(symbol, 14, 3, 3)                     # Stochastic
+
+# Volatility
+bb = self.bb(symbol, 20, 2, MovingAverageType.SIMPLE)  # Bollinger Bands
+atr = self.atr(symbol, 14)                              # ATR
+
+# Volume
+obv = self.obv(symbol)                                  # OBV
+adx = self.adx(symbol, 14)                             # ADX
+
+# Access values
+sma.current.value      # current value
+sma.previous.value     # previous value
+sma.is_ready           # False until enough data
+```
+
+MULTI-RESOLUTION INDICATORS (combine timeframes):
+```python
+def initialize(self):
+    # Add QQQ at DAILY for slow trend indicator
+    self._qqq = self.add_equity("QQQ", Resolution.DAILY).symbol
+    self._frama = self.frama(self._qqq.symbol, 16)
+
+    # Add AAPL at TICK for fast RSI via consolidator
+    self._aapl = self.add_equity("AAPL", Resolution.TICK).symbol
+    self._rsi = RelativeStrengthIndex(10)
+    consolidator = TickQuoteBarConsolidator(timedelta(minutes=5))
+    self.subscription_manager.add_consolidator(self._aapl.symbol, consolidator)
+    consolidator.data_consolidated += lambda _, bar: self._rsi.update(bar.end_time, bar.close)
+
+    # Warm up AAPL RSI with historical 5-min bars
+    for quote_bar in self.history[QuoteBar](self._aapl.symbol, 10, Resolution.MINUTE):
+        self._rsi.update(quote_bar.end_time, quote_bar.close)
+```
+
+INDICATOR WARM-UP (CRITICAL - prevents trading on incomplete signals):
+```python
+# Method 1: Warm up specific indicator
+self.warm_up_indicator(symbol, self._sma)
+
+# Method 2: Warm up algorithm with period
+self.set_warm_up(20, Resolution.DAILY)
+
+# Method 3: Always check before using
+if not self._sma.is_ready: return
+if self.is_warming_up: return
+```
+
+CUSTOM INDICATORS:
+```python
+class CustomSMA(PythonIndicator):
+    def __init__(self, period):
+        self.name = f"SMA({period})"
+        self.period = period
+        self.queue = deque(maxlen=period)
+        self.value = 0
+
+    def is_ready(self):
+        return len(self.queue) >= self.period
+
+    def update(self, input):
+        self.queue.append(input.value)
+        self.value = sum(self.queue) / len(self.queue)
+        return self.is_ready()
+```
+
+
+================================================================================
+8. SCHEDULING (RELIABLE, SCALABLE)
+================================================================================
+
+SCHEDULED EVENTS (the backbone of systematic trading):
+```python
+def initialize(self):
+    # Rebalance monthly 30min after open
+    self.schedule.on(
+        self.date_rules.month_start("SPY"),
+        self.time_rules.after_market_open("SPY", 30),
+        self._rebalance
+    )
+
+    # Daily stop loss check 30min before close
+    self.schedule.on(
+        self.date_rules.every_day("SPY"),
+        self.time_rules.before_market_close("SPY", 30),
+        self._check_stops
+    )
+
+    # Quarterly rebalancing (Jan, Apr, Jul, Oct)
+    self.schedule.on(
+        self.date_rules.month_start("SPY", 0),  # Months: 0=Jan
+        self.time_rules.midnight,
+        self._quarterly_rebalance
+    )
+```
+
+DATE RULES: every_day(), month_start(), month_end(), week_start(), week_end(),
+             on(datetime), year_start(), year_end()
+TIME RULES: after_market_open(), before_market_close(), midnight, at(hour, min)
+
+AVOID on_data FOR REBALANCING (use scheduling instead):
+- on_data fires on every bar - very expensive for portfolio rebalancing
+- Schedule at specific times to control frequency and reduce costs
+
+
+================================================================================
+9. HISTORICAL DATA & WARM-UP (RELIABLE)
+================================================================================
+
+HISTORY REQUESTS:
+```python
+# TradeBar history
+bars = self.history[TradeBar](symbol, 30, Resolution.DAILY)
+
+# DataFrame format (for ML/analysis)
+df = self.history(symbol, 30, Resolution.DAILY, flatten=True)
+
+# Multiple symbols
+df = self.history([symbol1, symbol2], 30, Resolution.DAILY)
+
+# Fundamental history
+fundamental_hist = self.history[Fundamental](symbol, timedelta(days=30))
+
+# All fundamentals (including delisted)
+all_funds = self.history[Fundamentals](timedelta(days=30))
+```
+
+WALK-FORWARD VALIDATION (prevents overfitting):
+```python
+# Training period: 2015-2019
+# Validation period: 2020-2022
+# Out-of-sample test: 2023-2024
+# NEVER optimize parameters on out-of-sample data
+```
+
+WARM-UP BEST PRACTICES:
+- Set warm_up period to at least the longest indicator lookback
+- Use same resolution as main data subscription
+- Always check is_warming_up at top of on_data
+- For universe strategies, use fundamental history for warm-up
+
+
+================================================================================
+10. CONSOLIDATORS (EFFECTIVE)
+================================================================================
+
+PURPOSE: Aggregate fine-grained data into custom timeframes
+
+```python
+# Time-based consolidation (e.g., 5-minute bars from tick/second/minute data)
+consolidator = TradeBarConsolidator(timedelta(minutes=5))
+self.subscription_manager.add_consolidator(symbol, consolidator)
+consolidator.data_consolidated += self._on_5min_bar
+
+# Calendar consolidation (e.g., weekly bars)
+consolidator = TradeBarConsolidator(CalendarType.WEEKLY)
+
+# Count-based consolidation (e.g., every 10 bars)
+consolidator = TradeBarConsolidator(10)
+
+# Renko bars (volatility-based)
+consolidator = RenkoConsolidator(1.0)  # $1 box size
+
+def _on_5min_bar(self, sender, bar: TradeBar) -> None:
+    self._indicator.update(bar.end_time, bar.close)
+```
+
+DEREGISTER WHEN DONE (avoid memory leaks in universe strategies):
+```python
+def on_securities_changed(self, changes):
+    for security in changes.removed_securities:
+        self.subscription_manager.remove_consolidator(
+            security.symbol, self._consolidators[security.symbol])
+```
+
+
+================================================================================
+11. STRATEGY PATTERNS (PROFITABLE)
+================================================================================
+
+--- CROSS-SECTIONAL MOMENTUM (12-1 Month Lookback) ---
+```python
+def _rebalance(self):
+    momentum = {}
+    for symbol in self.active_securities.keys():
+        history = list(self.history[TradeBar](symbol, 280, Resolution.DAILY))
+        if len(history) < 252: continue
+        end_price = history[-22].close   # skip most recent month (reversal effect)
+        start_price = history[0].close
+        if start_price == 0: continue
+        momentum[symbol] = float(end_price / start_price - 1)
+
+    top_count = max(1, len(momentum) // 10)  # top decile
+    winners = sorted(momentum, key=momentum.get, reverse=True)[:top_count]
+    weight = 1.0 / len(winners)
+    for symbol in winners:
+        self.set_holdings(symbol, weight)
+    for holding in self.portfolio.values():
+        if holding.invested and holding.symbol not in winners:
+            self.liquidate(holding.symbol)
+```
+
+--- BOLLINGER BAND MEAN REVERSION ---
+```python
+def initialize(self):
+    self._bb = self.bb(self._spy, 20, 2, MovingAverageType.SIMPLE, Resolution.DAILY)
+    self.set_warm_up(20, Resolution.DAILY)
+
+def on_data(self, slice):
+    if self.is_warming_up or not self._bb.is_ready: return
+    price = slice.bars.get(self._spy)
+    if price is None: return
+    close = price.close
+    if not self.portfolio[self._spy].invested:
+        if close < self._bb.lower_band.current.value:
+            self.set_holdings(self._spy, 1)  # long when oversold
+    elif self.portfolio[self._spy].is_long:
+        if close >= self._bb.middle_band.current.value:
+            self.liquidate(self._spy)  # exit at mean
+```
+
+--- VALUE FACTOR (Low P/E Selection) ---
+```python
+def _fundamental_filter(self, fundamental):
+    if self.time.month not in [1, 4, 7, 10]:  # quarterly rebalance
+        return Universe.UNCHANGED
+    screened = [
+        x for x in fundamental
+        if x.has_fundamental_data
+        and x.price > 5
+        and x.dollar_volume > 5_000_000
+        and 0 < x.valuation_ratios.pe_ratio < 50
+        and x.market_cap > 1_000_000_000
+    ]
+    return [x.symbol for x in sorted(screened, key=lambda x: x.valuation_ratios.pe_ratio)[:20]]
+```
+
+--- EARNINGS SURPRISE / FUNDAMENTAL EVENT ---
+```python
+def on_data(self, slice):
+    last_filing = self._equity.fundamentals.financial_statements.file_date.value
+    if self._last_filing_date and last_filing != self._last_filing_date:
+        self.set_holdings(self._equity.symbol, 1)
+        self._exit_time = self.time + timedelta(7)
+    if self.portfolio[self._equity.symbol].invested and self.time >= self._exit_time:
+        self.liquidate()
+    self._last_filing_date = last_filing
+```
+
+--- PAIRS TRADING / STATISTICAL ARBITRAGE ---
+```python
+# Use cointegration test (Augmented Dickey-Fuller)
+from statsmodels.tsa.stattools import adfuller
+residuals = price_a - slope * price_b - intercept
+adf_stat, p_value = adfuller(residuals)[:2]
+if adf_stat <= -3.45:  # reject unit root -> cointegrated
+    self._threshold = 2 * np.std(residuals)
+```
+
+--- CRYPTO SPOT/FUTURES ARBITRAGE ---
+```python
+def initialize(self):
+    self._spot = self.add_crypto("BTCUSDT", market=Market.BYBIT)
+    self._future = self.add_crypto_future("BTCUSDT", market=Market.BYBIT)
+    self._threshold = 0.005  # 0.5% spread
+
+def on_data(self, slice):
+    if not (self._spot.symbol in slice.quote_bars and
+            self._future.symbol in slice.quote_bars): return
+    spread = (self._spot.price - self._future.price) / self._future.price
+    if spread > self._threshold and not self._future.holdings.is_long:
+        self.sell(self._spot.symbol, qty)   # sell expensive spot
+        self.buy(self._future.symbol, qty)  # buy cheap future
+```
+
+--- PENNY STOCK SHORT MOMENTUM REVERSAL ---
+```python
+# Universe: penny stocks with high upward momentum
+# Signal: price breaks above Bollinger upper band -> short
+# Exit: 10% drop from entry OR price returns below middle band
+security.bbands.updated += self.on_bb_updated
+
+def on_bb_updated(self, bb, _):
+    if security.price > bb.upper_band.current.value:
+        shortable_qty = security.shortable_provider.shortable_quantity(symbol, self.time)
+        quantity = max(self.calculate_order_quantity(symbol, -0.1), -shortable_qty)
+        self.market_order(symbol, quantity)
+        self.limit_order(symbol, -quantity, 0.9 * security.bid_price)  # 10% profit target
+```
+
+
+================================================================================
+12. EQUITY OPTIONS (PROFITABLE)
+================================================================================
+
+SETUP (CRITICAL - use RAW normalization):
+```python
+def initialize(self):
+    self.settings.seed_initial_prices = True          # ensure prices seeded
+    self._underlying = self.add_equity("SPY",
+        data_normalization_mode=DataNormalizationMode.RAW).symbol  # REQUIRED for options
+
+    # Universe-based (recommended for strategy backtesting)
+    option = self.add_option("SPY")
+    option.set_filter(lambda u: u.expiration(0, 30).strikes(-5, 5))
+    self._canonical = option.symbol
+
+    # Individual contract
+    chain = self.option_chain(self._underlying, flatten=True).data_frame
+    # Filter and subscribe manually
+```
+
+OPTION CONTRACT FILTERING:
+```python
+# By strategy type
+option.set_filter(lambda u: u.straddle(30))
+option.set_filter(lambda u: u.iron_condor(30, 5, 10))
+option.set_filter(lambda u: u.expiration(0, 30).strikes(-20, 20))
+
+# By Greeks
+option.set_filter(lambda u: u.delta(0.25, 0.75).expiration(0, 90))
+
+# 0DTE (same-day expiry - highest volatility, best for spreads)
+option.set_filter(lambda u: u.expiration(0, 0).strikes(-10, 10))
+
+# Custom selector (most precise - avoids subscribing unnecessary contracts)
+def _filter(self, universe: OptionFilterUniverse) -> OptionFilterUniverse:
+    return universe.delta(0.5, 1.5).gamma(0.0001, 0.0006).expiration(0, 30)
+option.set_filter(self._filter)
+```
+
+ACCESSING OPTION DATA:
+```python
+def on_data(self, slice: Slice) -> None:
+    chain = slice.option_chains.get(self._canonical)
+    if not chain: return
+    contracts = chain.contracts
+
+    # Get specific contract
+    contract = chain.contracts.get(self._contract_symbol)
+    if contract:
+        delta = contract.greeks.delta
+        iv = contract.implied_volatility
+        open_interest = contract.open_interest
+        # Mid price (more accurate than close)
+        quote = slice.quote_bars.get(self._contract_symbol)
+        mid_price = (quote.bid.close + quote.ask.close) * 0.5
+```
+
+OPTION STRATEGIES:
+```python
+# Covered Call
+self.market_order(aapl_symbol, 100)               # own underlying
+self.market_order(call_contract, -1)              # sell OTM call
+
+# Long Straddle (buy volatility)
+long_straddle = OptionStrategies.straddle(canonical, strike, expiry)
+self.buy(long_straddle, 1)
+
+# Bull Put Spread (defined-risk income)
+# Buy lower strike put, sell higher strike put
+self.market_order(itm_put, 1)
+self.market_order(otm_put, -1)
+
+# 0DTE Bull Put Spread
+filtered = [x for x in contracts if x.expiry < self.time + timedelta(1)
+            and x.right == OptionRight.PUT]
+itm_put = sorted(filtered, key=lambda x: abs(x.strike - underlying_price - 5))[0]
+otm_put = sorted(filtered, key=lambda x: abs(x.strike - underlying_price + 5))[0]
+```
+
+WHEEL STRATEGY (income generation):
+```python
+# Phase 1: Sell OTM put -> collect premium
+put_symbol = self.get_target_contract(OptionRight.PUT, spy_price * (1 - otm_threshold))
+self.set_holdings(put_symbol, -0.2)
+
+# Phase 2: If assigned, sell OTM call on underlying
+call_symbol = self.get_target_contract(OptionRight.CALL, spy_price * (1 + otm_threshold))
+self.market_order(call_symbol, -self.portfolio[spy_symbol].quantity /
+    self.securities[spy_symbol].symbol_properties.contract_multipliers)
+```
+
+DELTA HEDGING (delta-neutral strategies):
+```python
+# Calculate net delta across all option legs
+net_delta = 0
+for leg in straddle_legs:
+    contract = chain.contracts.get(leg.symbol)
+    if contract: net_delta += contract.greeks.delta
+# Include underlying shares
+net_delta += self.portfolio[underlying].quantity / 100  # normalize
+# Hedge
+if abs(net_delta) > hedge_threshold:
+    self.market_order(underlying, -int(net_delta * 100))
+```
+
+GREEKS (only calculate when needed - expensive):
+- Delta: directional exposure (0 to 1 for calls, -1 to 0 for puts)
+- Gamma: rate of delta change
+- Theta: time decay per day (negative for long options)
+- Vega: sensitivity to implied volatility changes
+- Rho: interest rate sensitivity
+
+KEY OPTION RULES:
+- Always exit positions before expiration to avoid assignment risk
+- Use set_filter sparingly to limit contract subscriptions (performance)
+- For 0DTE: close positions at least 1 hour before market close
+- seed_initial_prices=True is required for same-timestep contract trading
+
+
+================================================================================
+13. CORPORATE ACTIONS (RELIABLE)
+================================================================================
+
+SPLITS:
+- LEAN automatically adjusts position quantity based on split_factor
+- If post-split quantity is not a valid lot size, remainder credited to cashbook
+- Reset and re-warm indicators using SCALED_RAW data after splits
+- Backtest without RAW: splits factored into historical prices automatically
+
+DIVIDENDS:
+- With ADJUSTED/TOTAL_RETURN normalization: factored into prices
+- With RAW normalization: cash credited to cashbook automatically
+- Reset and re-warm indicators after dividend payments
+
+SYMBOL CHANGES:
+- LEAN maps old ticker to new Symbol automatically (map files)
+- Cancel orders when ticker changes (use on_order_event to resubmit)
+
+DELISTINGS:
+- WARNING notice arrives on final trading day
+- LEAN auto-liquidates if you don't exit yourself
+- Best practice: always exit on WARNING to control exit price
+
+ACCESSING DELISTED SECURITIES:
+```python
+# securities.values() excludes delisted
+# securities.total iterates ALL including delisted
+for security in self.securities.total:
+    pass
+```
+
+
+================================================================================
+14. MACHINE LEARNING INTEGRATION (EFFECTIVE)
+================================================================================
+
+SUPPORTED LIBRARIES: PyTorch, TensorFlow, Keras, Scikit-Learn, XGBoost,
+HuggingFace (Chronos-T5, DistilBERT, FinBERT), GPLearn, Copula
+
+WALK-FORWARD TRAINING (prevents overfitting):
+```python
+def initialize(self):
+    self._training_length = 252  # 1 year training window
+    self._model = None
+    self.schedule.on(self.date_rules.month_start(),
+        self.time_rules.midnight, self._train_model)
+
+def _train_model(self):
+    history = self.history(self._symbol, self._training_length, Resolution.DAILY)
+    X, y = self._prepare_features(history)
+    self._model = sklearn.ensemble.RandomForestClassifier()
+    self._model.fit(X[:-1], y[1:])  # predict next day's direction
+
+def on_data(self, slice):
+    if not self._model: return
+    features = self._get_current_features()
+    prediction = self._model.predict([features])[0]
+    if prediction > 0:
+        self.set_holdings(self._symbol, 1)
+    else:
+        self.liquidate(self._symbol)
+```
+
+OBJECT STORE (persist ML models between runs):
+```python
+# Save model
+import pickle
+self.object_store.save("my_model", pickle.dumps(self._model))
+
+# Load model
+if self.object_store.contains_key("my_model"):
+    self._model = pickle.loads(self.object_store.read_bytes("my_model"))
+```
+
+ALTERNATIVE DATA (edge for profitability):
+- Sentiment: Benzinga news, Brain NLP, FinBERT, Smart Insider
+- Fundamentals: Morningstar, FRED, Nasdaq
+- Crypto: CoinAPI, CoinGecko, Kaiko
+- Government: SEC filings, RegAlytics, Treasury data
+- Quiver Quantitative: Congress trades, lobbying, insider data
+- ExtractAlpha: Cross-asset model signals
+
+
+================================================================================
+15. PERFORMANCE OPTIMIZATION (SCALABLE)
+================================================================================
+
+NUMBA JIT COMPILATION (10-100x speedup for numerical loops):
+```python
+import numpy as np
+from numba import jit
+
+@jit(nopython=True)
+def calculate_signals(prices):
+    result = np.zeros(len(prices))
+    for i in range(1, len(prices)):
+        result[i] = prices[i] / prices[i-1] - 1
+    return result
+```
+
+LRU CACHE (avoid repeated computations):
+```python
+from functools import lru_cache
+
+@lru_cache(maxsize=512)
+def compute_factor(symbol_str, period):
+    # expensive computation cached
+    pass
+```
+
+STORE C# OBJECT REFERENCES (avoid repeated Python.Net bridge calls):
+```python
+# SLOW: Crosses Python/C# bridge multiple times per call
+def on_data(self, slice):
+    avg = self.portfolio[self._symbol].average_price  # bridge crossing
+    qty = self.portfolio[self._symbol].quantity       # bridge crossing again
+
+# FAST: Cross bridge once, store reference
+def on_data(self, slice):
+    holding = self.portfolio[self._symbol]  # one bridge crossing
+    avg = holding.average_price             # Python-side access
+    qty = holding.quantity                  # Python-side access
+```
+
+MINIMIZE on_data WORK:
+- Do heavy computation in scheduled events, not on_data
+- Cache results of expensive calculations
+- Use asynchronous universe selection
+- Limit number of security subscriptions to what you actually need
+
+RESOLUTION SELECTION:
+- Use DAILY for fundamental/long-horizon strategies (cheapest)
+- Use MINUTE for intraday strategies (moderate cost)
+- Avoid TICK unless you specifically need tick-level analysis
+
+
+================================================================================
+16. ALGORITHM FRAMEWORK - MODULAR PIPELINE (SCALABLE)
+================================================================================
+
+FIVE MODULES (clean separation of concerns):
+1. Universe Selection: What to trade
+2. Alpha Model: When and which direction to trade (generates Insights)
+3. Portfolio Construction: How much to allocate
+4. Risk Management: Position sizing limits and drawdown controls
+5. Execution: How to place orders optimally
+
+```python
+class FrameworkAlgorithm(QCAlgorithm):
+    def initialize(self):
+        self.set_universe_selection(
+            FundamentalUniverseSelectionModel(self._filter))
+        self.set_alpha(
+            MomentumAlphaModel(lookback=252))
+        self.set_portfolio_construction(
+            EqualWeightingPortfolioConstructionModel(
+                rebalance=self.date_rules.month_start()))
+        self.add_risk_management(
+            MaximumDrawdownPercentPerSecurity(0.05))  # 5% per-security stop
+        self.set_execution(
+            ImmediateExecutionModel())
+```
+
+INSIGHTS (Alpha output):
+```python
+# Emit an insight: buy SPY for 1 month with 70% confidence
+self.emit_insights(Insight.price(symbol, timedelta(days=30),
+    InsightDirection.UP, magnitude=0.1, confidence=0.7))
+```
+
+BUILT-IN MODELS:
+- Universe: FundamentalUniverseSelectionModel, ETFConstituentUniverseSelectionModel
+- Alpha: MACDTrendAlgorithm, RsiAlphaModel, BasePairsTradingAlphaModel
+- Portfolio: EqualWeightingPortfolioConstructionModel, BlackLittermanOptimizationPortfolioConstructionModel
+- Risk: MaximumDrawdownPercentPortfolio, MaximumUnrealizedProfitPercentPerSecurity
+- Execution: ImmediateExecutionModel, VolumeWeightedAveragePriceExecutionModel
+
+
+================================================================================
+17. RISK MANAGEMENT (RELIABLE, PROFITABLE)
+================================================================================
+
+POSITION SIZING (Kelly Criterion for optimal growth):
+```python
+# Kelly fraction = edge / odds
+kelly_fraction = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win
+# Use half-Kelly in practice for safety
+position_size = min(kelly_fraction * 0.5, 0.2)  # cap at 20%
+```
+
+DRAWDOWN CONTROLS:
+```python
+# Per-security stop loss
+self.add_risk_management(MaximumDrawdownPercentPerSecurity(0.05))
+
+# Portfolio-level drawdown halt
+self.add_risk_management(MaximumDrawdownPercentPortfolio(0.10))
+
+# Trailing stop implementation
+def on_data(self, slice):
+    if self.portfolio[symbol].unrealized_profit_percent < -0.05:
+        self.liquidate(symbol)  # 5% trailing stop
+
+# Take profit
+if self.portfolio[symbol].unrealized_profit_percent > 0.15:
+    self.liquidate(symbol)  # 15% take profit
+```
+
+DIVERSIFICATION RULES:
+- Max 5-10% per single position
+- Diversify across sectors (use MorningstarSectorCode)
+- Diversify across asset classes where possible
+- Monitor correlation between positions
+
+PORTFOLIO REBALANCING:
+```python
+# Rebalance with automatic liquidation of old positions
+targets = [PortfolioTarget(symbol, weight) for symbol, weight in weights.items()]
+self.set_holdings(targets, liquidate_existing_holdings=True)
+```
+
+MARGIN MONITORING:
+```python
+if self.portfolio.margin_remaining < self.portfolio.total_portfolio_value * 0.1:
+    # Reduce positions to free margin
+    self.liquidate()
+```
+
+
+================================================================================
+18. BIASES TO AVOID (PROFITABLE)
+================================================================================
+
+LOOK-AHEAD BIAS (most dangerous):
+- Never use future data in signals - LEAN's Time Frontier prevents this
+- Watch for: using adjusted data without proper normalization
+- Watch for: training ML models on the full dataset before splitting
+
+SURVIVORSHIP BIAS:
+- Your universe should include delisted companies
+- QuantConnect data includes delisted stocks
+- Don't filter universe to only currently-traded stocks
+
+OVERFITTING:
+- Don't optimize parameters on the same data you'll trade
+- Walk-forward optimization only
+- Use out-of-sample validation
+- Fewer parameters = more robust strategy
+
+DATA DREDGING / P-HACKING:
+- Form hypothesis FIRST, then test
+- Don't scan hundreds of indicators to find what worked
+- Apply Bonferroni correction if testing multiple strategies
+
+12 BEHAVIORAL BIASES TO AVOID IN STRATEGY DESIGN:
+1. Anchoring: Don't anchor to entry price for exit decisions
+2. Availability: Recent dramatic events shouldn't dominate your model
+3. Confirmation: Test against your thesis, not for it
+4. Disposition Effect: Don't hold losers too long or sell winners too early
+5. Endowment: Don't value positions you own higher just because you own them
+6. Herd Mentality: Don't follow crowded trades
+7. Loss Aversion: Losses and gains of equal size should matter equally
+8. Narrative Fallacy: Don't post-hoc rationalize patterns as causal
+9. Overconfidence: Assume your backtest will perform worse live
+10. Recency: Long historical testing periods matter
+11. Status Quo: Don't avoid rebalancing due to inertia
+12. Sunk Cost: Exit losing positions regardless of entry price
+
+TRANSACTION COST NEGLECT:
+- Always model realistic fees (IB: $0.005/share or 0.35% for US equity)
+- Include slippage especially for illiquid securities
+- High-frequency strategies are particularly sensitive to transaction costs
+
+
+================================================================================
+19. PERFORMANCE METRICS (PROFITABLE)
+================================================================================
+
+KEY METRICS TO TARGET:
+- Sharpe Ratio > 1.0 (risk-adjusted return, higher is better)
+- Sortino Ratio > 1.5 (like Sharpe but only penalizes downside)
+- CAGR: Compound Annual Growth Rate (absolute return)
+- Maximum Drawdown < 20% (peak-to-trough decline)
+- Alpha > 0% (excess return vs benchmark)
+- Beta: market sensitivity (0=uncorrelated, 1=market-like)
+- Information Ratio: alpha / tracking error
+- Win Rate: % of profitable trades
+- Profit-Loss Ratio: avg winner / avg loser (> 1.5 preferred)
+- Expectancy = (Win Rate * Avg Win) - (Loss Rate * Avg Loss)
+- Calmar Ratio = CAGR / Max Drawdown (higher is better)
+
+PERFORMANCE CHART PLOTTING:
+```python
+self.plot("Strategy", "Signal", signal_value)
+self.plot("Portfolio", "Cash", self.portfolio.cash)
+self.plot("Risk", "DrawdownPct", drawdown)
+```
+
+LOGGING:
+```python
+self.log(f"Rebalanced: {len(targets)} positions, cash={self.portfolio.cash:.2f}")
+self.debug(f"Signal: rsi={self._rsi.current.value:.2f}")
+```
+
+
+================================================================================
+20. LIVE TRADING CONSIDERATIONS (RELIABLE)
+================================================================================
+
+SUPPORTED BROKERS: Interactive Brokers, TradeStation, Tastytrade, Alpaca,
+Charles Schwab, Binance, Bybit, Tradier, Kraken, Coinbase, OANDA, dYdX
+
+LIVE vs BACKTEST DIFFERENCES:
+- Bar building: live uses microsecond timestamps (small OHLCV differences vs backtest)
+- Corporate actions: arrive at 6/7 AM ET live (midnight in backtest)
+- Fundamentals: arrive at ~6/7 AM ET, update daily; financial ratios update daily
+- Order fills: real latency, real bid/ask spreads apply
+- Short availability: actually varies by brokerage and date
+
+PAPER TRADING: Always run paper trading before going live
+- All strategies should paper trade for at least 1 month
+
+DEPLOYMENT CHECKLIST:
+- [ ] Set appropriate brokerage model matching your broker
+- [ ] Model realistic fees and slippage
+- [ ] Test short availability for short strategies
+- [ ] Handle all corporate actions (splits, dividends, delistings)
+- [ ] Monitor margin remaining during live trading
+- [ ] Set up notifications for errors (self.notify.email())
+- [ ] Test order event handlers thoroughly
+- [ ] Use realistic warm-up periods before going live
+
+NOTIFICATIONS:
+```python
+self.notify.email("your@email.com", "Trade Alert", f"Bought {symbol}")
+self.notify.sms("+1234567890", "Trade executed")
+```
+
+BROKERAGE-SPECIFIC NOTES:
+- Interactive Brokers: Best for US equity, options; use IB fee model
+- Alpaca: Good for commission-free US equity
+- Binance/Bybit: For crypto strategies
+- OANDA: For forex
+
+
+================================================================================
+21. KEY CODE PATTERNS & TEMPLATES
+================================================================================
+
+TEMPLATE: DAILY REBALANCING MOMENTUM STRATEGY
+```python
+class MomentumStrategy(QCAlgorithm):
+    def initialize(self) -> None:
+        self.set_start_date(2020, 1, 1)
+        self.set_cash(100_000)
+        self.set_brokerage_model(BrokerageModel.INTERACTIVE_BROKERS_BROKERAGE)
+        self.universe_settings.resolution = Resolution.DAILY
+        self.universe_settings.asynchronous = True
+        self.add_universe(self._filter)
+        self.schedule.on(self.date_rules.month_start("SPY"),
+            self.time_rules.after_market_open("SPY", 30), self._rebalance)
+
+    def _filter(self, fundamental):
+        return [x.symbol for x in sorted(
+            [f for f in fundamental if f.has_fundamental_data
+             and f.price > 5 and f.dollar_volume > 5_000_000],
+            key=lambda x: x.dollar_volume, reverse=True)[:200]]
+
+    def _rebalance(self):
+        momentum = {}
+        for symbol in self.active_securities.keys():
+            hist = list(self.history[TradeBar](symbol, 280, Resolution.DAILY))
+            if len(hist) < 252: continue
+            start, end = hist[0].close, hist[-22].close
+            if start > 0: momentum[symbol] = end / start - 1
+        if not momentum: return
+        top = sorted(momentum, key=momentum.get, reverse=True)[:max(1, len(momentum)//10)]
+        w = 1.0 / len(top)
+        targets = [PortfolioTarget(s, w) for s in top]
+        self.set_holdings(targets, liquidate_existing_holdings=True)
+
+    def on_data(self, slice: Slice) -> None:
+        pass  # logic is in scheduled event
+```
+
+TEMPLATE: INTRADAY MEAN REVERSION WITH RISK CONTROLS
+```python
+class MeanReversionIntraday(QCAlgorithm):
+    def initialize(self) -> None:
+        self.set_start_date(2022, 1, 1)
+        self.set_cash(100_000)
+        self._spy = self.add_equity("SPY", Resolution.MINUTE).symbol
+        self._bb = self.bb(self._spy, 20, 2, MovingAverageType.SIMPLE, Resolution.MINUTE)
+        self._rsi = self.rsi(self._spy, 14, Resolution.MINUTE)
+        self.set_warm_up(20, Resolution.MINUTE)
+        # Close all positions at end of day
+        self.schedule.on(self.date_rules.every_day(self._spy),
+            self.time_rules.before_market_close(self._spy, 5), self.liquidate)
+
+    def on_data(self, slice: Slice) -> None:
+        if self.is_warming_up: return
+        if not self._bb.is_ready or not self._rsi.is_ready: return
+        bar = slice.bars.get(self._spy)
+        if not bar: return
+        holding = self.portfolio[self._spy]
+        if not holding.invested:
+            if bar.close < self._bb.lower_band.current.value and self._rsi.current.value < 30:
+                self.set_holdings(self._spy, 0.9)
+        elif holding.is_long:
+            if bar.close >= self._bb.middle_band.current.value or self._rsi.current.value > 70:
+                self.liquidate(self._spy)
+            elif holding.unrealized_profit_percent < -0.01:  # 1% stop loss
+                self.liquidate(self._spy)
+```
+
+TEMPLATE: MULTI-INDICATOR SIGNAL (FRAMA + RSI)
+```python
+class FramaRsiStrategy(QCAlgorithm):
+    def initialize(self) -> None:
+        self._qqq = self.add_equity("QQQ", Resolution.DAILY).symbol
+        self._aapl = self.add_equity("AAPL", Resolution.TICK).symbol
+        self._frama = self.frama(self._qqq, 16)
+        self._rsi = RelativeStrengthIndex(10)
+        consolidator = TickQuoteBarConsolidator(timedelta(minutes=5))
+        self.subscription_manager.add_consolidator(self._aapl, consolidator)
+        consolidator.data_consolidated += lambda _, bar: self._rsi.update(bar.end_time, bar.close)
+        for qb in self.history[QuoteBar](self._aapl, 10, Resolution.MINUTE):
+            self._rsi.update(qb.end_time, qb.close)
+        self.warm_up_indicator(self._qqq, self._frama)
+
+    def on_data(self, slice: Slice) -> None:
+        if self._aapl not in slice.ticks: return
+        frama = self._frama.current.value
+        prev_frama = self._frama.previous.value
+        rsi = self._rsi.current.value
+        if self.portfolio[self._aapl].holdings.invested:
+            if (self.portfolio[self._aapl].is_long and frama < prev_frama) or \
+               (self.portfolio[self._aapl].is_short and frama > prev_frama):
+                self.liquidate(self._aapl)
+        elif frama > prev_frama and rsi >= 70:
+            self.set_holdings(self._aapl, 0.5)
+        elif frama < prev_frama and rsi <= 30:
+            self.set_holdings(self._aapl, -0.5)
+```
+
+
+================================================================================
+QUICK REFERENCE: MOST IMPORTANT RULES
+================================================================================
+
+RELIABILITY:
+  1. Always check is_warming_up and indicator.is_ready before trading
+  2. Use Symbol objects, not ticker strings
+  3. Handle all corporate actions (splits, dividends, delistings)
+  4. Set brokerage model to match your actual broker
+  5. Test edge cases: no data, delisted symbols, holidays
+
+SCALABILITY:
+  6. Use asynchronous universe selection
+  7. Schedule rebalancing, don't rebalance in on_data
+  8. Store C# object references to minimize Python.Net bridge calls
+  9. Use @jit for numerical loops, @lru_cache for repeated computations
+  10. Deregister indicators and consolidators when securities leave universe
+
+EFFECTIVENESS:
+  11. Warm up indicators with appropriate historical data
+  12. Use multiple confirming signals to reduce false positives
+  13. Walk-forward validate, never optimize on out-of-sample data
+  14. Test across multiple market regimes (bull, bear, sideways)
+  15. Account for transaction costs - they kill high-frequency strategies
+
+COST-EFFECTIVENESS:
+  16. Use Limit orders where possible; Market orders only when necessary
+  17. Model realistic slippage (SpreadSlippageModel)
+  18. Minimize rebalancing frequency to reduce turnover
+  19. Check short availability before running short strategies
+  20. Use position size thresholds to avoid trading tiny adjustments
+
+PROFITABILITY:
+  21. Use proper position sizing (Kelly or fixed fraction)
+  22. Maintain stop losses (hard % or indicator-based)
+  23. Diversify across sectors and market regimes
+  24. Target Sharpe > 1.0, Max Drawdown < 20%
+  25. Paper trade for 1+ month before going live
+
+================================================================================
+22. CRYPTO DATA — SUBSCRIPTIONS & LIVE DATA COLLECTION (RELIABLE)
+================================================================================
+
+SUPPORTED CRYPTO MARKETS: Binance, Bybit, Coinbase, Kraken
+
+ACCOUNT TYPES:
+- CASH account: no short selling, positions expressed in base currency (BTC, ETH)
+- MARGIN account: allows shorts; required for Crypto Futures
+
+--- SPOT CRYPTO SETUP ---
+```python
+def initialize(self) -> None:
+    self.set_brokerage_model(BrokerageModel.BINANCE, AccountType.CASH)
+    self.set_account_currency("USDT", 100_000)   # set starting cash in quote currency
+    self._btc = self.add_crypto("BTCUSDT", market=Market.BINANCE).symbol
+    self._eth = self.add_crypto("ETHUSDT", market=Market.BINANCE).symbol
+```
+
+ACCESS SPOT HOLDINGS (virtual pairs use cash_book, not standard portfolio):
+```python
+btc_amount = self.portfolio.cash_book['BTC'].amount
+btc_value  = self.portfolio.cash_book['BTC'].value_in_account_currency
+security_holding = self.portfolio[self._btc]   # also valid for P&L
+```
+
+--- CRYPTO FUTURES (PERPETUAL) SETUP ---
+```python
+def initialize(self) -> None:
+    self.set_brokerage_model(BrokerageModel.BINANCE, AccountType.MARGIN)
+    self.set_account_currency("USDT", 100_000)
+    btcusdt = self.add_crypto_future("BTCUSDT")
+    self._symbol   = btcusdt.symbol
+    self._lot_size = btcusdt.symbol_properties.lot_size   # respect minimum order increment
+    btcusdt.base_currency.set_amount(10)                  # optional: set initial BTC balance
+```
+
+FUNDING RATE HANDLING (perpetual contracts pay/receive every 8 hours):
+```python
+def on_data(self, slice: Slice) -> None:
+    if not self.portfolio.invested and self.is_market_open(self._symbol):
+        self.market_order(self._symbol, 10)
+
+    margin_interest_rate = slice.margin_interest_rates.get(self._symbol)
+    if not margin_interest_rate:
+        return
+    interest_rate = margin_interest_rate.interest_rate
+    holding = self.portfolio[self._symbol]
+    position_value = holding.get_quantity_value(holding.quantity).amount
+    actual_rate = slice.margin_interest_rates[self._symbol].interest_rate
+    funding = actual_rate * position_value / holding.security_price
+    # Adjust position size by the funding amount (round to lot size)
+    quantity = -funding // self._lot_size * self._lot_size
+    if quantity:
+        self.market_order(self._symbol, quantity)
+```
+
+CRYPTO FUTURES RULES:
+- Market: 24/7, no pre/post-market hours, no holidays
+- Can't trade with USD on Binance; must use USDT
+- Always check `self.is_market_open(symbol)` — market orders unsupported when closed
+- Round order quantities to lot_size: `qty = target // lot_size * lot_size`
+- Monitor USDT and BTC balances via `self.portfolio.cash_book`
+
+FUTURE-SPOT ARBITRAGE (simultaneous spot + perp opposite positions):
+```python
+self._spot = self.add_crypto("BTCUSDT", fill_forward=False, market=Market.BINANCE).symbol
+self._future = self.add_crypto_future("BTCUSDT", fill_forward=False, market=Market.BINANCE).symbol
+self._multiplier = self._future.symbol_properties.contract_multiplier
+self._threshold = 1.005  # 0.5% profit threshold
+
+def on_data(self, slice):
+    for security in [self._spot, self._future]:
+        if security.symbol not in slice.bars: return
+    spot   = self._spot.price
+    future = self._future.price
+    if not self._spot.invested:
+        if future >= spot * self._threshold:
+            self._enter(-1, 1)   # short spot, long future
+        elif spot >= future * self._threshold:
+            self._enter(1, -1)   # long spot, short future
+```
+
+INTER-MARKET SPREAD (same pair on two exchanges):
+```python
+self._binance  = self.add_crypto("BTCUSDT", market=Market.BINANCE).symbol
+self._coinbase = self.add_crypto("BTCUSD", market=Market.COINBASE).symbol
+```
+
+
+================================================================================
+23. OPTION GREEKS AS LEAN INDICATORS (EFFECTIVE)
+================================================================================
+
+AUTOMATIC INDICATORS (call-put mirror pair for IV smoothing):
+```python
+# Implied Volatility — mirror option smooths IV across put-call parity
+call_iv = self.iv(call_symbol, put_symbol)   # uses put as mirror
+put_iv  = self.iv(put_symbol, call_symbol)   # uses call as mirror
+
+# Delta, Gamma, Vega, Theta, Rho (same call+mirror pattern)
+call_delta = self.d(call_symbol, put_symbol)
+call_gamma = self.g(call_symbol, put_symbol)
+call_vega  = self.v(call_symbol, put_symbol)
+call_theta = self.t(call_symbol, put_symbol)
+call_rho   = self.r(call_symbol, put_symbol)
+```
+
+MANUAL INDICATORS (full pricing model control):
+```python
+from QuantConnect.Indicators.Options import (
+    ImpliedVolatility, Delta, Gamma, Vega, Theta, Rho)
+
+self._div_yield = DividendYieldProvider(self._underlying)
+self._pricing_model = OptionPricingModelType.FORWARD_TREE
+
+iv = ImpliedVolatility(
+    contract_a.symbol,
+    self.risk_free_interest_rate_model,
+    self._div_yield,
+    contract_b.symbol,           # mirror option
+    self._pricing_model)
+
+delta = Delta(
+    contract_a.symbol,
+    self.risk_free_interest_rate_model,
+    self._div_yield,
+    contract_b.symbol,
+    self._pricing_model)
+```
+
+IV SMOOTHING (average call and put IV across parity):
+```python
+iv_indicator.implied_volatility.set_smoothing_function(
+    lambda iv, mirror_iv: (iv + mirror_iv) * 0.5)
+```
+
+GREEK SOURCES — WHICH GIVES WHAT:
+| Source                  | Greeks data                        |
+|-------------------------|------------------------------------|
+| Universe filter func    | Pre-calculated daily greeks        |
+| on_data Slice           | Live-price model-recalculated      |
+| history() request       | Pre-calculated daily greeks        |
+
+ACCESS GREEKS ON LIVE DATA (via price model):
+```python
+option = self.securities[contract.symbol]
+option.price_model = OptionPriceModels.binomial_cox_ross_rubinstein()
+
+# In on_data:
+iv    = contract.implied_volatility
+delta = contract.greeks.delta
+gamma = contract.greeks.gamma
+vega  = contract.greeks.vega
+theta = contract.greeks.theta
+rho   = contract.greeks.rho
+```
+
+PRICING MODELS:
+- `OptionPricingModelType.BINOMIAL_COX_ROSS_RUBINSTEIN` — default, American options
+- `OptionPricingModelType.FORWARD_TREE` — forward-tree model
+- `OptionPriceModels.binomial_cox_ross_rubinstein()` — for live price model on security
+
+
+================================================================================
+24. FOREX DATA — SUBSCRIPTIONS & HANDLING (RELIABLE)
+================================================================================
+
+SUBSCRIPTION:
+```python
+self._symbol = self.add_forex("EURUSD").symbol                    # default: Resolution.MINUTE
+self._symbol = self.add_forex("EURUSD", Resolution.DAILY).symbol
+self._symbol = self.add_forex("EURUSD", market=Market.OANDA).symbol
+self._symbol = self.add_forex("EURUSD", leverage=35).symbol       # up to 50x on OANDA margin
+self._symbol = self.add_forex("EURUSD", fill_forward=False).symbol
+```
+
+SUPPORTED MARKETS: Market.OANDA only (don't need to specify market parameter)
+
+DATA FORMATS:
+- TICK resolution: Quote ticks only (bid_price, bid_size, ask_price, ask_size)
+- SECOND/MINUTE/HOUR/DAILY: QuoteBar (bid bar + ask bar with open/high/low/close)
+- No TradeBar for Forex (currencies quote-driven, not trade-driven)
+
+QuoteBar (NBBO bid/ask):
+```python
+def on_data(self, slice: Slice) -> None:
+    quote_bar = slice.quote_bars.get(self._symbol)   # None if not found
+    bid_ask_spread = quote_bar.ask.close - quote_bar.bid.close
+    ask_price = quote_bar.ask.close
+    bid_price = quote_bar.bid.close
+    mid_price = quote_bar.close   # mean of bid and ask midpoints
+
+    # Iterate all pairs
+    for symbol, qb in slice.quote_bars.items():
+        ask = qb.ask.close
+```
+
+Tick data:
+```python
+ticks = slice.ticks.get(self._symbol, [])   # list of Tick objects
+for tick in ticks:
+    price = tick.price  # mid
+    # tick.ticktype distinguishes trade vs quote
+```
+
+FOREX MARKET HOURS: Sunday 5 PM ET to Friday 5 PM ET (standard Forex session)
+
+STRATEGIES:
+
+Example — Bid-Ask Spread Monitor (enter when spread is at minimum):
+```python
+self._forex = self.add_forex("USDJPY")
+self._spread_low = Minimum(12*60)   # 12-hour minimum spread indicator
+self.warm_up_indicator(self._forex.symbol, self._spread_low)
+
+def on_data(self, slice):
+    if self._forex.symbol not in slice.quote_bars: return
+    qb = slice.quote_bars[self._forex.symbol]
+    spread = qb.ask.close - qb.bid.close
+    self._spread_low.update(qb.end_time, spread)
+    if not self.portfolio.invested and spread == self._spread_low.current.value:
+        self.market_order(self._forex.symbol, 1000)
+```
+
+Example — NY Session Close (4:30 PM ET daily bars for daily close alignment):
+```python
+consolidator = QuoteBarConsolidator(self._consolidation_period)
+consolidator.data_consolidated += lambda _, bar: self.plot("Consolidated Bar", "Close", bar.close)
+self.subscription_manager.add_consolidator(self._forex.symbol, consolidator)
+
+def _consolidation_period(self, dt: datetime) -> CalendarInfo:
+    start = dt.replace(hour=16, minute=30, second=0, microsecond=0)
+    period = timedelta(1)
+    if dt.hour < 17: start -= period
+    return CalendarInfo(start, period)
+```
+
+ADD ALL FOREX PAIRS AT ONCE:
+```python
+for x in self.symbol_properties_database.get_symbol_properties_list(Market.OANDA, SecurityType.FOREX):
+    self.add_forex(x.key.symbol, Resolution.DAILY)
+```
+
+
+================================================================================
+25. FUTURES DATA — SUBSCRIPTIONS & HANDLING (EFFECTIVE, RELIABLE)
+================================================================================
+
+TWO MODES:
+1. `add_future()` — continuous contract universe (subscribes to a basket)
+2. `add_future_contract()` — individual specific contract
+
+--- CONTINUOUS CONTRACT UNIVERSE ---
+```python
+def initialize(self) -> None:
+    self._future = self.add_future(
+        Futures.Indices.SP_500_E_MINI,
+        extended_market_hours=True,
+        data_mapping_mode=DataMappingMode.OPEN_INTEREST,        # map to most-liquid contract
+        data_normalization_mode=DataNormalizationMode.BACKWARDS_RATIO,  # backward-adjust prices
+        contract_depth_offset=0                                 # 0=front month
+    )
+    self._future.set_filter(0, 182)                             # contracts expiring within 0-182 days
+    # OR use lambda filters:
+    self._future.set_filter(lambda u: u.front_month())
+    self._future.set_filter(lambda u: u.standards_only().front_month())
+```
+
+CRITICAL: Always trade `self._future.mapped`, NOT `self._future.symbol`:
+```python
+adjusted_price = self.securities[self._future.symbol].price  # continuous adjusted price
+raw_price      = self.securities[self._future.mapped].price  # actual tradeable contract
+self.market_order(self._future.mapped, 1)                    # order the MAPPED contract
+```
+
+ROLLOVER WITH on_symbol_changed_events:
+```python
+def on_symbol_changed_events(self, symbol_changed_events: SymbolChangedEvents) -> None:
+    for symbol, changed_event in symbol_changed_events.items():
+        old_symbol = changed_event.old_symbol
+        new_symbol = changed_event.new_symbol
+        quantity = self.portfolio[old_symbol].quantity
+        tag = f"Rollover {old_symbol} -> {new_symbol}"
+        self.liquidate(old_symbol, tag=tag)
+        if quantity:
+            # Use limit order to avoid extreme fills; round to tick size
+            new_contract = self.securities[new_symbol]
+            self.limit_order(new_symbol, quantity,
+                self._get_limit_price(new_contract, new_contract.price), tag=tag)
+
+def _get_limit_price(self, security, target_price, round_up=True):
+    params = GetMinimumPriceVariationParameters(security, target_price)
+    pip = security.price_variation_model.get_minimum_price_variation(params)
+    return (int(target_price / pip) + int(round_up)) * pip
+```
+
+ROLLOVER TIMING: midnight ET in backtest; 6/7 AM ET in live trading.
+
+--- INDIVIDUAL FUTURES CONTRACTS ---
+```python
+# Get front-month contract from chain
+self._continuous = self.add_future(Futures.Indices.SP_500_E_MINI).symbol
+contract_symbol = list(self.futures_chain(self._continuous))[0].symbol
+self.add_future_contract(contract_symbol)
+
+# Parse contract directly by ticker
+contract_symbol = SymbolRepresentation.parse_future_symbol('ESZ25')
+self.add_future_contract(contract_symbol)
+
+# Seed initial prices to trade in same timestep as subscription
+self.settings.seed_initial_prices = True
+```
+
+FUTURES CHAIN IN on_data:
+```python
+def on_data(self, slice: Slice) -> None:
+    chain = slice.futures_chains.get(self._future.symbol.canonical)
+    if chain:
+        contracts = chain.contracts
+        for symbol, contract in contracts.items():
+            expiry = contract.expiry
+            open_interest = contract.open_interest
+            last_price = contract.last_price
+```
+
+FUTURES DATA RESOLUTIONS:
+- TICK: Trade Tick + Quote Tick (raw, filter dark pool)
+- SECOND/MINUTE/HOUR/DAILY: TradeBar + QuoteBar
+
+FILTER METHODS (FutureFilterUniverse):
+- `front_month()` — most liquid near-term contract
+- `back_month()` / `back_months()` — further-out contracts
+- `standards_only()` — exclude non-standard (e.g., weekly micro)
+- `set_filter(min_days, max_days)` — by days to expiry
+- `expiration(min_td, max_td)` — by timedelta range
+- `contracts(list_of_symbols)` — pick specific contracts
+
+CONTRACT MULTIPLIER (nominal value ordering):
+```python
+quantity = 500_000 / future.price // future.symbol_properties.contract_multiplier
+self.market_order(future.mapped, quantity)
+```
+
+DATA MAPPING MODES:
+- `DataMappingMode.OPEN_INTEREST` — maps to highest open interest contract
+- `DataMappingMode.LAST_TRADING_DAY` — maps until contract expires
+
+DATA NORMALIZATION MODES (for continuous contracts):
+- `DataNormalizationMode.BACKWARDS_RATIO` — proportional backward adjustment (good for % returns)
+- `DataNormalizationMode.FORWARD_PANAMA` — Panama Canal forward adjustment (good for level)
+- Raw/None — no adjustment (gaps at rollovers)
+
+CONTANGO ARBITRAGE (short far, long near):
+```python
+chain = slice.futures_chains.get(self._future.symbol)
+if chain and len(list(chain)) >= 2:
+    sorted_by_expiry = sorted(chain, key=lambda x: x.expiry)
+    near_contract = sorted_by_expiry[0]
+    far_contract  = sorted_by_expiry[-1]
+    if far_contract.bid_price >= near_contract.ask_price * 1.01:
+        self.market_order(far_contract.symbol, -1)
+        self.market_order(near_contract.symbol, 1)
+```
+
+FUTURES MARKET HOURS:
+- Pre-market: 00:00 to 09:30 ET
+- Market: 09:30 to 17:00 ET
+- Post-market: 18:00 to 00:00 ET
+- Extended hours only available at MINUTE/SECOND/TICK resolution
+
+
+================================================================================
+26. FUTURE OPTIONS — SUBSCRIPTIONS & STRATEGIES (EFFECTIVE)
+================================================================================
+
+IMPORTANT: Currently only European-style options supported for US Future Options.
+
+UNIVERSE SUBSCRIPTION:
+```python
+def initialize(self) -> None:
+    self.underlying = self.add_future(
+        Futures.Indices.SP_500_E_MINI,
+        extended_market_hours=True,
+        data_mapping_mode=DataMappingMode.OPEN_INTEREST,
+        data_normalization_mode=DataNormalizationMode.BACKWARDS_RATIO,
+        contract_depth_offset=0)
+    self.underlying.set_filter(0, 182)
+
+    # Add option universe with filter
+    self.add_future_option(self.underlying.symbol,
+        lambda option_filter_universe: option_filter_universe.strikes(-1, 1))
+```
+
+OPTION STRATEGY FILTERS (OptionFilterUniverse methods):
+```python
+# Single-contract strategies
+option_filter_universe.naked_call(min_days, strike_from_atm)
+option_filter_universe.naked_put(min_days, strike_from_atm)
+
+# Two-contract strategies
+option_filter_universe.call_spread(min_days, higher_strike_atm, lower_strike_atm)
+option_filter_universe.put_spread(min_days, higher_strike_atm, lower_strike_atm)
+option_filter_universe.straddle(min_days)
+option_filter_universe.strangle(min_days, higher_strike_atm, lower_strike_atm)
+option_filter_universe.call_calendar_spread(strike_atm, min_near_days, min_far_days)
+option_filter_universe.put_calendar_spread(strike_atm, min_near_days, min_far_days)
+
+# Multi-contract strategies
+option_filter_universe.call_butterfly(min_days, strike_spread)
+option_filter_universe.put_butterfly(min_days, strike_spread)
+option_filter_universe.iron_butterfly(min_days, strike_spread)
+option_filter_universe.iron_condor(min_days, near_strike_spread, far_strike_spread)
+option_filter_universe.box_spread(min_days, strike_spread)
+option_filter_universe.protective_collar(min_days, higher_strike_atm, lower_strike_atm)
+```
+
+ACCESSING OPTION CHAIN IN on_data:
+```python
+def on_data(self, slice: Slice) -> None:
+    if self.portfolio.invested: return
+    # Get option chain for the mapped future contract
+    symbol = Symbol.create_canonical_option(self.underlying.mapped)
+    chain = slice.option_chains.get(symbol)
+    if not chain or len(list(chain)) < 2: return
+
+    # Sort and pick contracts
+    sorted_by_strike = sorted([x.strike for x in chain])
+    expiry = min([x.expiry for x in chain])
+    itm_strike = sorted_by_strike[0]
+    otm_strike = sorted_by_strike[-1]
+
+    # Place option strategy as single order
+    option_strategy = OptionStrategies.bull_call_spread(symbol, itm_strike, otm_strike, expiry)
+    self.buy(option_strategy, 1)
+```
+
+INDIVIDUAL CONTRACT SUBSCRIPTION:
+```python
+# Method 1: from chain via option_chain method
+chain_df = self.option_chain(future_contract_symbol, flatten=True).data_frame
+expiry = chain_df.expiry.min()
+contract_symbol = chain_df[
+    (chain_df.expiry == expiry) & (chain_df.right == OptionRight.CALL)
+].sort_values('strike').index[-1]
+self.add_future_option_contract(contract_symbol)
+
+# Method 2: parse OSI ticker directly
+contract_symbol = SymbolRepresentation.parse_option_ticker_osi(
+    'ESU4 240920C07900000', SecurityType.FUTURE_OPTION, OptionStyle.AMERICAN, Market.CME)
+option = self.add_future_option_contract(contract_symbol)
+option.price_model = OptionPriceModels.binomial_cox_ross_rubinstein()
+```
+
+FUTURE OPTION RESOLUTIONS: MINUTE and HOUR (TradeBar + QuoteBar); no tick data.
+
+EXPIRY NOTE: US Future Options and their underlying Futures often expire same day
+and cash-settle — LEAN can auto-exercise at expiry. No need to handle exercise events.
+
+REMOVE A CONTRACT:
+```python
+self.remove_option_contract(self._option_contract_symbol)
+# cancels open orders and liquidates the holding
+```
+
+
+================================================================================
+27. ADDITIONAL IMPORTANT ALGORITHM PATTERNS (RELIABLE, EFFECTIVE)
+================================================================================
+
+--- SEEDING INITIAL PRICES FOR SAME-TIMESTEP TRADING ---
+When subscribing to contracts (futures, options) mid-algorithm, by default you
+must wait one Slice before you can trade. To trade immediately:
+```python
+self.settings.seed_initial_prices = True
+```
+
+--- DEREGISTERING SUBSCRIPTIONS (MEMORY MANAGEMENT) ---
+```python
+def on_securities_changed(self, changes: SecurityChanges) -> None:
+    for added in changes.added_securities:
+        # set up indicators, consolidators
+        pass
+    for removed in changes.removed_securities:
+        self.subscription_manager.remove_consolidator(
+            removed.symbol, self._consolidators.pop(removed.symbol))
+        # Also remove manual greek indicators
+        self.deregister_indicator(self._iv_indicators.pop(removed.symbol))
+```
+
+--- MULTI-ASSET CLASS INDICATOR WARM-UP ---
+```python
+# Warm up EMA on futures continuous contract
+self.warm_up_indicator(self._future.symbol, self._ema, Resolution.DAILY)
+
+# Warm up manually-fed indicator using historical QuoteBars
+for bar in self.history[QuoteBar](self._forex.symbol, 1000, Resolution.MINUTE):
+    self._rsi.update(bar.end_time, bar.close)
+```
+
+--- MINIMUM PRICE VARIATION (TICK SIZE) ---
+```python
+def _round_to_tick(self, security, price, round_up=True):
+    params = GetMinimumPriceVariationParameters(security, price)
+    pip = security.price_variation_model.get_minimum_price_variation(params)
+    return (int(price / pip) + int(round_up)) * pip
+```
+
+--- OPTION STRATEGY ABSTRACTION (vs manual leg orders) ---
+```python
+# Abstraction — cleaner, validates leg quantities automatically
+strategy = OptionStrategies.bull_call_spread(canonical_symbol, itm_strike, otm_strike, expiry)
+self.buy(strategy, 1)
+
+# Manual — more control
+self.market_order(call_itm_symbol, 1)
+self.market_order(call_otm_symbol, -1)
+```
+
+--- CALCULATE ORDER QUANTITY FROM NOMINAL VALUE ---
+```python
+# For futures: divide target $ by (price × multiplier)
+multiplier = future.symbol_properties.contract_multiplier
+quantity = int(500_000 / (future.price * multiplier))
+self.market_order(future.mapped, quantity)
+
+# For crypto: respect lot size
+lot_size = self.securities[self._symbol].symbol_properties.lot_size
+quantity = target_qty // lot_size * lot_size
+```
+
+--- CHECKING MARKET STATUS BEFORE ORDERS ---
+```python
+# Required for crypto futures (24/7 but market orders not allowed when closed)
+if not self.is_market_open(self._symbol):
+    return
+
+# For equity options: check underlying is open
+if not self.is_market_open(self._underlying):
+    return
+```
+
+--- OPEN INTEREST AS LIQUIDITY METRIC ---
+```python
+# Open interest: outstanding contracts not yet settled — updated once per day
+chain = slice.futures_chains.get(canonical_symbol)
+most_liquid = max(chain, key=lambda c: c.open_interest)
+```
+
+--- CANONICAL SYMBOL CREATION ---
+```python
+# For equity options chain lookup
+canonical = Symbol.create_canonical_option(underlying_symbol)
+chain = slice.option_chains.get(canonical)
+
+# For future options chain lookup
+canonical = Symbol.create_canonical_option(self._future.mapped)
+chain = slice.option_chains.get(canonical)
+```
+
+--- QUICK ASSET CLASS REFERENCE ---
+| Asset     | Method                    | Market Hours   | Data Format          |
+|-----------|---------------------------|----------------|----------------------|
+| Equity    | add_equity()              | 9:30-16:00 ET  | TradeBar, Tick       |
+| Crypto    | add_crypto()              | 24/7           | TradeBar, Tick       |
+| CryptoFut | add_crypto_future()       | 24/7           | TradeBar             |
+| Forex     | add_forex()               | Sun-Fri 5PM ET | QuoteBar, Tick       |
+| Futures   | add_future()              | Nearly 24/5    | TradeBar, QuoteBar   |
+| Options   | add_option()              | 9:30-16:00 ET  | TradeBar, QuoteBar   |
+| FutOpts   | add_future_option()       | Same as Fut    | TradeBar, QuoteBar   |
+| Index     | add_index()               | 9:30-16:00 ET  | TradeBar             |
+
+
+================================================================================
+QUICK REFERENCE: MOST IMPORTANT RULES
+================================================================================
+
+RELIABILITY:
+  1. Always check is_warming_up and indicator.is_ready before trading
+  2. Use Symbol objects, not ticker strings
+  3. Handle all corporate actions (splits, dividends, delistings)
+  4. Set brokerage model to match your actual broker
+  5. Test edge cases: no data, delisted symbols, holidays
+  6. Check is_market_open() for crypto futures before market orders
+
+SCALABILITY:
+  7. Use asynchronous universe selection
+  8. Schedule rebalancing, don't rebalance in on_data
+  9. Store C# object references to minimize Python.Net bridge calls
+  10. Use @jit for numerical loops, @lru_cache for repeated computations
+  11. Deregister indicators and consolidators when securities leave universe
+
+EFFECTIVENESS:
+  12. Warm up indicators with appropriate historical data
+  13. Use multiple confirming signals to reduce false positives
+  14. Walk-forward validate, never optimize on out-of-sample data
+  15. Test across multiple market regimes (bull, bear, sideways)
+  16. Account for transaction costs - they kill high-frequency strategies
+  17. For futures: always use seed_initial_prices or wait for next bar
+
+COST-EFFECTIVENESS:
+  18. Use Limit orders where possible; Market orders only when necessary
+  19. Model realistic slippage (SpreadSlippageModel)
+  20. Minimize rebalancing frequency to reduce turnover
+  21. Check short availability before running short strategies
+  22. Use position size thresholds to avoid trading tiny adjustments
+  23. For futures rollovers: use limit orders to avoid extreme quote fills
+
+PROFITABILITY:
+  24. Use proper position sizing (Kelly or fixed fraction)
+  25. Maintain stop losses (hard % or indicator-based)
+  26. Diversify across sectors and market regimes
+  27. Target Sharpe > 1.0, Max Drawdown < 20%
+  28. Paper trade for 1+ month before going live
+  29. For crypto: always account for funding rate costs in position sizing
+
+================================================================================
+28. ORDER MANAGEMENT — FULL CONTROL OF TRADE EXECUTION (RELIABLE)
+================================================================================
+
+ORDER TYPES — COMPLETE REFERENCE:
+```python
+# MARKET ORDER — fills immediately at current price (worst price guarantee)
+ticket = self.market_order(symbol, quantity)
+ticket = self.market_order(symbol, -10, tag="exit signal")
+
+# LIMIT ORDER — fills only at or better than limit_price
+ticket = self.limit_order(symbol, quantity, limit_price)
+ticket = self.limit_order(symbol, 100, 149.50, tag="breakout entry")
+
+# STOP MARKET — triggers market order when price crosses stop_price
+ticket = self.stop_market_order(symbol, -quantity, stop_price)  # stop loss
+
+# STOP LIMIT — triggers limit order when price crosses stop_price
+ticket = self.stop_limit_order(symbol, quantity, stop_price, limit_price)
+
+# TRAILING STOP — dynamic stop that follows price by a fixed amount
+ticket = self.trailing_stop_order(symbol, -quantity, trailing_amount,
+    trailing_as_percentage=True)   # True = %, False = dollar amount
+
+# MARKET ON OPEN — fills at official opening auction price
+ticket = self.market_on_open_order(symbol, quantity)   # next open
+
+# MARKET ON CLOSE — fills at official closing auction price (4:00 PM for US equity)
+ticket = self.market_on_close_order(symbol, quantity)  # today's close
+
+# LIMIT IF TOUCHED — like stop-limit but for opposite direction
+ticket = self.limit_if_touched_order(symbol, quantity, trigger_price, limit_price)
+
+# COMBO MARKET — multi-leg strategy at market (options spreads)
+self.combo_market_order(legs, quantity)   # legs = list of Leg objects
+
+# COMBO LIMIT — multi-leg strategy with combined limit price
+self.combo_limit_order(legs, quantity, limit_price)
+```
+
+ORDER TICKET — monitor, update, cancel after placing:
+```python
+ticket = self.limit_order(symbol, 100, 149.50)
+
+# Update price or quantity
+ticket.update_limit_price(150.00)
+ticket.update_quantity(200)
+ticket.update_stop_price(new_stop)   # for stop orders
+ticket.update_tag("revised entry")
+
+# Check status
+status   = ticket.status               # OrderStatus enum
+fill_qty = ticket.quantity_filled
+avg_px   = ticket.average_fill_price
+is_open  = ticket.status not in [OrderStatus.FILLED, OrderStatus.CANCELED,
+                                   OrderStatus.INVALID, OrderStatus.NONE]
+# Cancel
+ticket.cancel("reason for cancel")
+```
+
+ORDER EVENT HANDLER — react to every state change:
+```python
+def on_order_event(self, order_event: OrderEvent) -> None:
+    if order_event.status == OrderStatus.FILLED:
+        self.log(f"FILL {order_event.symbol}: qty={order_event.fill_quantity} "
+                 f"@ {order_event.fill_price:.4f}, fee={order_event.order_fee}")
+
+    elif order_event.status == OrderStatus.PARTIALLY_FILLED:
+        remaining = order_event.quantity - order_event.fill_quantity
+        self.log(f"Partial fill, {remaining} remaining")
+
+    elif order_event.status == OrderStatus.CANCELED:
+        ticket = self.transactions.get_order_ticket(order_event.order_id)
+        if ticket and "symbol changed event" in (ticket.tag or ""):
+            # Resubmit after rollover/ticker change
+            self.transactions.add_order(ticket.submit_request)
+
+    elif order_event.status == OrderStatus.INVALID:
+        self.log(f"Order INVALID: {order_event.message}")
+```
+
+TRANSACTIONS OBJECT — query open orders, order history:
+```python
+# All open orders for a symbol
+open_orders = self.transactions.get_open_orders(symbol)
+
+# All open order tickets
+tickets = self.transactions.get_open_order_tickets()
+
+# Specific ticket by order ID
+ticket = self.transactions.get_order_ticket(order_id)
+
+# Cancel all open orders for a symbol
+self.transactions.cancel_open_orders(symbol)
+
+# All orders (complete history)
+all_orders = self.transactions.get_orders()
+```
+
+ORDER PROPERTIES — brokerage-specific settings before placing:
+```python
+order_properties = InteractiveBrokersOrderProperties()
+order_properties.time_in_force = TimeInForce.DAY          # or GoodTilCanceled, GoodTilDate
+order_properties.outside_regular_trading_hours = True     # extended hours
+
+ticket = self.limit_order(symbol, qty, price,
+    order_properties=order_properties, tag="overnight limit")
+```
+
+TIME IN FORCE:
+- `TimeInForce.GoodTilCanceled` — stays open until filled or manually canceled
+- `TimeInForce.DAY` — cancels at end of session if unfilled
+- `TimeInForce.GoodTilDate(datetime)` — cancels at specific date/time
+
+ORDER SIZING HELPERS:
+```python
+# Calculate quantity for a portfolio weight without placing order
+qty = self.calculate_order_quantity(symbol, 0.10)   # 10% of portfolio
+
+# Set holdings by target weight (handles sizing automatically)
+self.set_holdings(symbol, 0.25)                     # 25% weight
+self.set_holdings(symbol, 0)                        # exit position
+self.set_holdings(targets, liquidate_existing_holdings=True)  # full rebalance
+
+# Liquidate
+self.liquidate(symbol)    # close specific position
+self.liquidate()          # close ALL positions
+```
+
+BRACKET ORDER PATTERN (entry + stop + target):
+```python
+entry = self.market_order(symbol, quantity, tag="entry")
+
+# Wait for fill in on_order_event, then place bracket
+def on_order_event(self, order_event):
+    if order_event.status == OrderStatus.FILLED:
+        if order_event.order_id == self._entry_id:
+            fill = order_event.fill_price
+            stop  = self.stop_market_order(symbol, -quantity, fill * 0.97,   tag="stop")
+            limit = self.limit_order(symbol, -quantity, fill * 1.05,          tag="target")
+```
+
+KEY ORDER MANAGEMENT RULES:
+- Avoid market orders in illiquid or wide-spread markets — use limit orders
+- Always tag orders (`tag="..."`) for debugging order events
+- Cancel stale limit orders that haven't filled within expected timeframe
+- Monitor order events for INVALID status — usually means insufficient margin
+- For options: combo orders prevent leg mis-fills; prefer `self.buy(strategy, n)`
+- Round futures quantities to tick size before placing orders
+
+
+================================================================================
+29. PORTFOLIO MANAGEMENT — POSITIONS, ALLOCATION & REBALANCING (COST-EFFECTIVE)
+================================================================================
+
+PORTFOLIO OBJECT — real-time state:
+```python
+# Portfolio-level metrics
+self.portfolio.total_portfolio_value     # total equity (cash + positions)
+self.portfolio.cash                      # free cash
+self.portfolio.total_unrealized_profit   # open P&L
+self.portfolio.total_fees_paid           # cumulative fees
+self.portfolio.margin_remaining          # available buying power
+self.portfolio.margin_used               # currently pledged margin
+self.portfolio.invested                  # True if any open positions
+
+# Per-symbol holding
+h = self.portfolio[symbol]
+h.invested                  # bool: have a position
+h.is_long / h.is_short      # bool: direction
+h.quantity                  # signed shares/contracts
+h.average_price             # cost basis
+h.unrealized_profit         # open P&L in cash
+h.unrealized_profit_percent # open P&L as fraction of cost
+h.holdings_value            # market value (signed)
+h.total_sale_value          # abs market value
+h.profit                    # total P&L including closed trades
+
+# Current weight in portfolio
+weight = h.holdings_value / self.portfolio.total_portfolio_value
+```
+
+PORTFOLIO CONSTRUCTION APPROACHES:
+
+1. Equal Weighting:
+```python
+symbols = list(self.active_securities.keys())
+if not symbols: return
+weight = 1.0 / len(symbols)
+targets = [PortfolioTarget(s, weight) for s in symbols]
+self.set_holdings(targets, liquidate_existing_holdings=True)
+```
+
+2. Volatility-Weighted (inverse vol):
+```python
+weights = {}
+for symbol in symbols:
+    hist = self.history[TradeBar](symbol, 60, Resolution.DAILY)
+    returns = [h.close / list(hist)[i-1].close - 1 for i, h in enumerate(hist) if i > 0]
+    vol = np.std(returns) if returns else 1.0
+    weights[symbol] = 1.0 / vol if vol > 0 else 0
+
+total = sum(weights.values())
+targets = [PortfolioTarget(s, w / total) for s, w in weights.items()]
+self.set_holdings(targets, liquidate_existing_holdings=True)
+```
+
+3. Market-Cap Weighted (from fundamentals):
+```python
+caps = {s: self.securities[s].fundamentals.market_cap for s in symbols
+        if self.securities[s].fundamentals}
+total_cap = sum(caps.values())
+targets = [PortfolioTarget(s, c / total_cap) for s, c in caps.items()]
+self.set_holdings(targets, liquidate_existing_holdings=True)
+```
+
+4. Score / Signal Weighted (rank-weighted allocation):
+```python
+sorted_symbols = sorted(signals, key=signals.get, reverse=True)[:20]
+n = len(sorted_symbols)
+# Linearly decreasing weights (rank 1 gets most)
+raw = {s: n - i for i, s in enumerate(sorted_symbols)}
+total = sum(raw.values())
+targets = [PortfolioTarget(s, raw[s] / total) for s in sorted_symbols]
+self.set_holdings(targets, liquidate_existing_holdings=True)
+```
+
+SMART REBALANCING (avoid tiny trades):
+```python
+def _needs_rebalance(self, symbol, target_weight, threshold=0.01):
+    current_weight = (self.portfolio[symbol].holdings_value
+                      / self.portfolio.total_portfolio_value)
+    return abs(current_weight - target_weight) > threshold
+
+# Only rebalance positions that have drifted more than 1%
+targets = [PortfolioTarget(s, w) for s, w in target_weights.items()
+           if self._needs_rebalance(s, w)]
+if targets:
+    self.set_holdings(targets)
+```
+
+CASH MANAGEMENT:
+```python
+# Reserve free cash buffer to avoid margin calls
+self.settings.free_portfolio_value_percentage = 0.05   # keep 5% as cash
+self.settings.free_portfolio_value = 5_000              # or fixed dollar amount
+
+# Check cash before placing large orders
+if self.portfolio.cash < required_cash:
+    self.liquidate(least_important_position)
+```
+
+MULTI-CURRENCY PORTFOLIO (crypto / forex):
+```python
+# Each currency is a Cash object in cash_book
+usdt_amount = self.portfolio.cash_book['USDT'].amount
+btc_amount   = self.portfolio.cash_book['BTC'].amount
+btc_value    = self.portfolio.cash_book['BTC'].value_in_account_currency
+
+# Iterate all currencies
+for currency, cash in self.portfolio.cash_book.items():
+    self.log(f"{currency}: {cash.amount:.4f} = {cash.value_in_account_currency:.2f} USD")
+```
+
+SECTOR DIVERSIFICATION:
+```python
+from QuantConnect.Data.Fundamental import MorningstarSectorCode
+
+by_sector = {}
+for symbol in self.active_securities.keys():
+    sec = self.securities[symbol]
+    if not sec.fundamentals: continue
+    sector = sec.fundamentals.asset_classification.morningstar_sector_code
+    by_sector.setdefault(sector, []).append(symbol)
+
+# Equal weight across sectors, equal weight within sector
+targets = []
+for sector_symbols in by_sector.values():
+    sector_weight = 1.0 / len(by_sector)
+    per_stock_weight = sector_weight / len(sector_symbols)
+    for s in sector_symbols:
+        targets.append(PortfolioTarget(s, per_stock_weight))
+self.set_holdings(targets, liquidate_existing_holdings=True)
+```
+
+LEVERAGE MANAGEMENT:
+```python
+# Set leverage per security
+security.set_leverage(2.0)
+
+# Monitor total gross exposure
+gross = sum(abs(self.portfolio[s].holdings_value)
+            for s in self.portfolio.keys() if self.portfolio[s].invested)
+leverage_ratio = gross / self.portfolio.total_portfolio_value
+
+if leverage_ratio > 2.0:
+    for s in self.portfolio.keys():
+        if self.portfolio[s].invested:
+            self.set_holdings(s, self.portfolio[s].holdings_value
+                              / self.portfolio.total_portfolio_value / leverage_ratio * 2.0)
+```
+
+PORTFOLIO TRACKING (log key metrics):
+```python
+def _log_portfolio_state(self):
+    n_positions  = sum(1 for h in self.portfolio.values() if h.invested)
+    total_pnl    = self.portfolio.total_unrealized_profit
+    cash_pct     = self.portfolio.cash / self.portfolio.total_portfolio_value
+    self.log(f"Positions: {n_positions} | Unrealized P&L: {total_pnl:.0f} | "
+             f"Cash: {cash_pct:.1%} | Margin remaining: {self.portfolio.margin_remaining:.0f}")
+```
+
+KEY PORTFOLIO MANAGEMENT RULES:
+- `liquidate_existing_holdings=True` in set_holdings closes ALL positions not in target list
+- Always monitor margin_remaining — drops to 0 triggers LEAN forced liquidation
+- Keep 5-10% cash buffer (settings.free_portfolio_value_percentage)
+- Log portfolio state after every rebalance for auditability
+- For options: portfolio[contract_symbol].invested checks a specific contract
+
+
+================================================================================
+30. RISK MANAGEMENT — DRAWDOWN CONTROLS & POSITION LIMITS (RELIABLE, PROFITABLE)
+================================================================================
+
+BUILT-IN RISK MANAGEMENT MODELS (Algorithm Framework):
+```python
+# Maximum per-security drawdown — liquidates if unrealized loss exceeds threshold
+self.add_risk_management(MaximumDrawdownPercentPerSecurity(0.05))    # 5% per security
+
+# Maximum portfolio drawdown — halts ALL trading if portfolio drops threshold
+self.add_risk_management(MaximumDrawdownPercentPortfolio(0.10))      # 10% portfolio halt
+
+# Maximum unrealized profit — takes profits when position up by threshold
+self.add_risk_management(MaximumUnrealizedProfitPercentPerSecurity(0.15))
+
+# Trailing stop — trailing drawdown from peak
+self.add_risk_management(TrailingStopRiskManagementModel(0.05))     # 5% trailing
+
+# Composite — stack multiple risk models
+self.add_risk_management(MaximumDrawdownPercentPerSecurity(0.05))
+self.add_risk_management(MaximumDrawdownPercentPortfolio(0.15))
+self.add_risk_management(MaximumUnrealizedProfitPercentPerSecurity(0.20))
+```
+
+CUSTOM RISK MANAGEMENT MODEL (Framework approach):
+```python
+class MyRiskManagementModel(RiskManagementModel):
+    def __init__(self, max_drawdown=0.05, max_position_weight=0.20):
+        self._max_dd = max_drawdown
+        self._max_weight = max_position_weight
+
+    def manage_risk(self, algorithm, targets):
+        new_targets = []
+        for holding in algorithm.portfolio.values():
+            if not holding.invested: continue
+            # Per-security drawdown stop
+            if holding.unrealized_profit_percent < -self._max_dd:
+                new_targets.append(PortfolioTarget(holding.symbol, 0))
+            # Position concentration limit
+            weight = abs(holding.holdings_value / algorithm.portfolio.total_portfolio_value)
+            if weight > self._max_weight:
+                new_targets.append(PortfolioTarget(holding.symbol,
+                    self._max_weight * (1 if holding.is_long else -1)))
+        return new_targets
+```
+
+MANUAL STOP LOSS PATTERNS (Classic Algorithm style):
+```python
+def on_data(self, slice: Slice) -> None:
+    for symbol in list(self.portfolio.keys()):
+        holding = self.portfolio[symbol]
+        if not holding.invested: continue
+
+        # Hard stop loss
+        if holding.unrealized_profit_percent < -0.05:
+            self.liquidate(symbol, tag="stop-loss 5%")
+
+        # Trailing stop (track peak price manually)
+        current_price = self.securities[symbol].price
+        self._peak[symbol] = max(self._peak.get(symbol, current_price), current_price)
+        if holding.is_long and current_price < self._peak[symbol] * 0.95:
+            self.liquidate(symbol, tag="trailing stop 5%")
+
+        # Take profit
+        if holding.unrealized_profit_percent > 0.20:
+            self.liquidate(symbol, tag="take profit 20%")
+
+        # Time-based exit
+        if (self.time - self._entry_time.get(symbol, self.time)).days > 30:
+            self.liquidate(symbol, tag="time exit 30d")
+```
+
+PORTFOLIO-LEVEL DRAWDOWN MONITOR:
+```python
+def initialize(self):
+    self._peak_value    = 0
+    self._max_dd_limit  = 0.15     # 15% drawdown halts trading
+    self._trading_halted = False
+
+def on_data(self, slice):
+    total_value = self.portfolio.total_portfolio_value
+    self._peak_value = max(self._peak_value, total_value)
+    drawdown = (self._peak_value - total_value) / self._peak_value
+
+    if drawdown >= self._max_dd_limit and not self._trading_halted:
+        self.liquidate()
+        self._trading_halted = True
+        self.log(f"TRADING HALTED: Portfolio drawdown {drawdown:.1%} exceeded {self._max_dd_limit:.1%}")
+
+    if self._trading_halted: return   # don't enter new trades
+
+    # ... normal strategy logic ...
+```
+
+POSITION CONCENTRATION LIMITS:
+```python
+def _check_concentration(self, symbol, target_weight):
+    max_single = 0.15          # 15% max per position
+    max_sector = 0.35          # 35% max per sector
+
+    # Cap single position
+    target_weight = min(abs(target_weight), max_single) * (1 if target_weight >= 0 else -1)
+
+    # Cap sector exposure
+    sector = self.securities[symbol].fundamentals.asset_classification.morningstar_sector_code
+    current_sector_exposure = sum(
+        abs(self.portfolio[s].holdings_value) / self.portfolio.total_portfolio_value
+        for s in self.portfolio.keys()
+        if self.portfolio[s].invested
+        and self.securities[s].fundamentals
+        and self.securities[s].fundamentals.asset_classification.morningstar_sector_code == sector
+    )
+    if current_sector_exposure + abs(target_weight) > max_sector:
+        target_weight = max(0, max_sector - current_sector_exposure) * (1 if target_weight >= 0 else -1)
+
+    return target_weight
+```
+
+VOLATILITY-BASED POSITION SIZING (ATR-based):
+```python
+# Size position so a 2-ATR move equals 1% portfolio loss
+atr  = self._atr[symbol].current.value
+risk_per_trade = self.portfolio.total_portfolio_value * 0.01   # 1% risk
+quantity = int(risk_per_trade / (2 * atr))
+quantity = min(quantity, int(self.portfolio.cash / self.securities[symbol].price))
+self.market_order(symbol, quantity)
+```
+
+KELLY CRITERION (optimal position sizing):
+```python
+def _kelly_size(self, win_rate, avg_win, avg_loss):
+    if avg_loss == 0: return 0.0
+    b = avg_win / avg_loss
+    kelly = win_rate - (1 - win_rate) / b
+    return max(0, min(kelly * 0.5, 0.20))   # half-Kelly, capped at 20%
+```
+
+MARGIN MONITORING:
+```python
+def on_data(self, slice):
+    margin_pct = self.portfolio.margin_remaining / self.portfolio.total_portfolio_value
+
+    if margin_pct < 0.10:   # < 10% margin remaining
+        # Reduce largest position to free margin
+        holdings = sorted(
+            [h for h in self.portfolio.values() if h.invested],
+            key=lambda h: abs(h.holdings_value), reverse=True)
+        if holdings:
+            self.set_holdings(holdings[0].symbol, 0,
+                              tag="margin reduction")
+```
+
+CORRELATION-AWARE RISK (avoid doubling up correlated positions):
+```python
+# Compute rolling correlation using history
+def _get_correlation(self, sym_a, sym_b, lookback=60):
+    hist = self.history([sym_a, sym_b], lookback, Resolution.DAILY)
+    returns = hist['close'].unstack(0).pct_change().dropna()
+    if sym_a in returns and sym_b in returns:
+        return returns[sym_a].corr(returns[sym_b])
+    return 0.0
+
+# Only enter new position if correlation with existing < 0.7
+for existing_symbol in self.portfolio.keys():
+    if self.portfolio[existing_symbol].invested:
+        if self._get_correlation(symbol, existing_symbol) > 0.7:
+            return   # skip highly correlated position
+```
+
+KEY RISK MANAGEMENT RULES:
+- Always define max drawdown before deploying any strategy
+- Trailing stops outperform fixed stops in trending markets
+- Half-Kelly sizing is safer than full-Kelly (accounts for estimation error)
+- Never let a single position exceed 15-20% of portfolio
+- Never let a single sector exceed 30-35% of portfolio
+- Halt all new entries (not just liquidate) if portfolio drawdown > 15%
+- In live trading: set real broker stop orders as backup to algo stops
+
+
+================================================================================
+31. STRATEGY MANAGEMENT — ALGORITHM FRAMEWORK DEEP DIVE (SCALABLE, PROFITABLE)
+================================================================================
+
+ALGORITHM FRAMEWORK PIPELINE:
+Universe → Alpha → Portfolio Construction → Risk Management → Execution
+
+Each component is swappable and composable. Mix built-in models with custom ones.
+
+--- UNIVERSE SELECTION MODELS ---
+```python
+# Fundamental (equity universe filter)
+self.set_universe_selection(FundamentalUniverseSelectionModel(self._filter_func))
+
+# ETF constituents
+self.set_universe_selection(
+    ETFConstituentUniverseSelectionModel(
+        Symbol.create("SPY", SecurityType.EQUITY, Market.USA)))
+
+# Manual (fixed list)
+symbols = [Symbol.create(t, SecurityType.EQUITY, Market.USA) for t in ["AAPL","MSFT"]]
+self.set_universe_selection(ManualUniverseSelectionModel(symbols))
+
+# Option universe (chained with equity)
+self.set_universe_selection(
+    OptionUniverseSelectionModel(timedelta(1), self._select_option_chain_symbols))
+```
+
+--- ALPHA MODELS — EMIT INSIGHTS ---
+```python
+# Built-in
+self.set_alpha(MACDTrendAlgorithm(12, 26, 9, MovingAverageType.SIMPLE, Resolution.DAILY))
+self.set_alpha(RsiAlphaModel(14, Resolution.DAILY))
+self.set_alpha(BasePairsTradingAlphaModel(1, Resolution.DAILY, cointegration=True))
+
+# Composite (combine multiple alpha models)
+self.set_alpha(CompositeAlphaModel(
+    MACDTrendAlgorithm(12, 26, 9),
+    RsiAlphaModel(14)))
+```
+
+CUSTOM ALPHA MODEL:
+```python
+class MyMomentumAlphaModel(AlphaModel):
+    def __init__(self, lookback=252, top_n=20):
+        self._lookback = lookback
+        self._top_n    = top_n
+
+    def update(self, algorithm: QCAlgorithm, slice: Slice) -> List[Insight]:
+        insights = []
+        scores = {}
+        for symbol in algorithm.active_securities.keys():
+            hist = list(algorithm.history[TradeBar](symbol, self._lookback + 22, Resolution.DAILY))
+            if len(hist) < self._lookback: continue
+            momentum = hist[-22].close / hist[0].close - 1   # skip last month
+            scores[symbol] = momentum
+
+        if not scores: return []
+        top = sorted(scores, key=scores.get, reverse=True)[:self._top_n]
+        for symbol in algorithm.portfolio.keys():
+            if algorithm.portfolio[symbol].invested and symbol not in top:
+                insights.append(Insight.price(symbol, timedelta(1), InsightDirection.FLAT))
+        for symbol in top:
+            insights.append(Insight.price(symbol, timedelta(days=30),
+                InsightDirection.UP, magnitude=scores[symbol], confidence=0.7))
+        return insights
+
+    def on_securities_changed(self, algorithm, changes):
+        pass   # no per-security state needed here
+```
+
+INSIGHT ATTRIBUTES:
+```python
+Insight.price(
+    symbol,                          # asset
+    timedelta(days=30),              # how long signal is valid
+    InsightDirection.UP,             # UP / DOWN / FLAT
+    magnitude=0.05,                  # expected return (optional)
+    confidence=0.7,                  # 0-1 weight for portfolio construction
+    source_model="MyAlpha",          # identifier
+    weight=0.25                      # direct weight hint (optional)
+)
+```
+
+--- PORTFOLIO CONSTRUCTION MODELS ---
+```python
+# Equal weighting — each insight gets equal portfolio weight
+self.set_portfolio_construction(
+    EqualWeightingPortfolioConstructionModel(
+        rebalance=self.date_rules.month_start()))   # rebalance trigger
+
+# Confidence-weighted
+self.set_portfolio_construction(
+    ConfidenceWeightedPortfolioConstructionModel(
+        rebalance=self.date_rules.week_start()))
+
+# Black-Litterman (Bayesian mean-variance optimization)
+self.set_portfolio_construction(
+    BlackLittermanOptimizationPortfolioConstructionModel(
+        rebalance=self.date_rules.month_start(),
+        portfolio_bias=PortfolioBias.LONG))
+
+# Mean-Variance Optimization (Markowitz efficient frontier)
+self.set_portfolio_construction(
+    MeanVarianceOptimizationPortfolioConstructionModel(
+        rebalance=self.date_rules.month_start(),
+        portfolio_bias=PortfolioBias.LONG,
+        lookback=63,
+        period=63,
+        resolution=Resolution.DAILY,
+        target_return=0.25,
+        optimizer=MinimumVariancePortfolioOptimizer()))
+
+# Single Share — one contract per insight (for options/futures)
+self.set_portfolio_construction(SingleSharePortfolioConstructionModel())
+```
+
+CUSTOM PORTFOLIO CONSTRUCTION MODEL:
+```python
+class RankWeightedPortfolioConstructionModel(PortfolioConstructionModel):
+    def create_targets(self, algorithm: QCAlgorithm,
+                       insights: List[Insight]) -> List[PortfolioTarget]:
+        # Sort insights by confidence descending
+        active = [i for i in insights if i.direction != InsightDirection.FLAT]
+        active.sort(key=lambda i: i.confidence or 0, reverse=True)
+        n = len(active)
+        if n == 0:
+            # Flat all positions
+            return [PortfolioTarget(s, 0)
+                    for s in algorithm.portfolio.keys()
+                    if algorithm.portfolio[s].invested]
+        # Linear rank weights sum to 1
+        weights = [(n - i) / sum(range(1, n + 1)) for i in range(n)]
+        targets = [PortfolioTarget(i.symbol, w * (1 if i.direction == InsightDirection.UP else -1))
+                   for i, w in zip(active, weights)]
+        # Exit positions for symbols not in active insights
+        active_symbols = {i.symbol for i in active}
+        for s in algorithm.portfolio.keys():
+            if algorithm.portfolio[s].invested and s not in active_symbols:
+                targets.append(PortfolioTarget(s, 0))
+        return targets
+```
+
+--- EXECUTION MODELS ---
+```python
+# Immediate — places market orders immediately
+self.set_execution(ImmediateExecutionModel())
+
+# Volume-Weighted Average Price — slices orders throughout the day
+self.set_execution(VolumeWeightedAveragePriceExecutionModel())
+
+# Standard Deviation Execution — fills within a tolerance band of the benchmark
+self.set_execution(StandardDeviationExecutionModel(
+    maximum_order_quantity_percentage_volume=0.05))
+```
+
+CUSTOM EXECUTION MODEL:
+```python
+class LimitOrderExecutionModel(ExecutionModel):
+    def execute(self, algorithm: QCAlgorithm, targets: List[PortfolioTarget]) -> None:
+        for target in targets:
+            symbol    = target.symbol
+            quantity  = target.quantity
+            security  = algorithm.securities[symbol]
+            current_q = algorithm.portfolio[symbol].quantity
+
+            order_qty = quantity - current_q
+            if order_qty == 0: continue
+
+            # Use limit order slightly inside the spread
+            price = security.ask_price if order_qty > 0 else security.bid_price
+            # 0.1% better than market
+            limit_price = price * (0.999 if order_qty > 0 else 1.001)
+            algorithm.limit_order(symbol, order_qty, limit_price, tag="LimitExecution")
+
+    def on_securities_changed(self, algorithm, changes):
+        # Cancel open orders for removed securities
+        for removed in changes.removed_securities:
+            algorithm.transactions.cancel_open_orders(removed.symbol)
+```
+
+STRATEGY COMBINATIONS (multi-alpha, multi-timeframe):
+```python
+class MultiStrategyAlgorithm(QCAlgorithm):
+    def initialize(self):
+        self.set_universe_selection(FundamentalUniverseSelectionModel(self._filter))
+
+        # Combine momentum (long-term) + mean reversion (short-term)
+        self.set_alpha(CompositeAlphaModel(
+            MomentumAlphaModel(lookback=252, top_n=20),
+            MeanReversionAlphaModel(lookback=20, z_score_threshold=2.0)))
+
+        # Use confidence weighting so strongly-signaled assets get more
+        self.set_portfolio_construction(
+            ConfidenceWeightedPortfolioConstructionModel(
+                rebalance=self.date_rules.week_start()))
+
+        # Stack: per-security stop + portfolio drawdown guard
+        self.add_risk_management(MaximumDrawdownPercentPerSecurity(0.07))
+        self.add_risk_management(MaximumDrawdownPercentPortfolio(0.15))
+
+        # Use limit orders to reduce slippage
+        self.set_execution(VolumeWeightedAveragePriceExecutionModel())
+```
+
+REBALANCING TRIGGERS (Portfolio Construction models accept):
+```python
+# Date-based
+rebalance=self.date_rules.every_day("SPY")
+rebalance=self.date_rules.week_start()
+rebalance=self.date_rules.month_start()
+rebalance=self.date_rules.year_start()
+
+# Timedelta (e.g., every 5 days)
+rebalance=timedelta(days=5)
+
+# Function — full control (return True to trigger rebalance)
+def _should_rebalance(utc_time):
+    return utc_time.weekday() == 0   # every Monday
+rebalance=_should_rebalance
+
+# Always rebalance on every insight emission
+rebalance=Resolution.DAILY
+```
+
+INSIGHT CANCELLATION (alpha->portfolio coordination):
+```python
+# Cancel insights for removed securities (critical for universe changes)
+def on_securities_changed(self, algorithm, changes):
+    for removed in changes.removed_securities:
+        algorithm.insights.cancel([removed.symbol])
+```
+
+KEY STRATEGY MANAGEMENT RULES:
+- Separate concerns strictly: Alpha never places orders; PCM never reads market data
+- Keep Alpha models stateless where possible — store per-symbol state in dicts
+- Use CompositeAlphaModel to layer complementary signals (trend + reversion)
+- Always cancel lingering insights when securities leave universe
+- Portfolio Construction rebalance triggers fire BEFORE Alpha update — set appropriately
+- Execution models receive ALL targets; they are responsible for canceling stale open orders
+- Always add_risk_management AFTER set_portfolio_construction for correct pipeline order
+- Test each component in isolation (swap in NullAlphaModel, NullExecutionModel) for debugging
+
+
+================================================================================
+QUICK REFERENCE: MANAGEMENT RULES SUMMARY
+================================================================================
+
+ORDER MANAGEMENT:
+  O1. Use limit orders by default; market orders only when urgency outweighs cost
+  O2. Always tag orders — tag="" makes debugging order events very hard
+  O3. Check ticket.status in on_order_event before acting on fills
+  O4. Cancel stale limit orders after N bars or N minutes
+  O5. Use bracket orders (entry + stop + target) in a single logical unit
+
+PORTFOLIO MANAGEMENT:
+  P1. Always reserve cash buffer (free_portfolio_value_percentage = 0.05)
+  P2. Use set_holdings(targets, liquidate_existing_holdings=True) for full rebalances
+  P3. Apply position weight thresholds (>1% drift) before rebalancing to cut turnover
+  P4. Track portfolio[symbol].unrealized_profit_percent for each open position
+  P5. Log portfolio state after every rebalance event
+
+RISK MANAGEMENT:
+  R1. Define drawdown limits before deploying (per-security 5-7%, portfolio 10-15%)
+  R2. Stack MaximumDrawdownPercentPerSecurity + MaximumDrawdownPercentPortfolio
+  R3. Use trailing stops in trending markets, fixed stops in ranging markets
+  R4. Never let any single position exceed 15% of portfolio value
+  R5. Halt new entries (not just liquidate) when portfolio drawdown > threshold
+
+STRATEGY MANAGEMENT:
+  S1. Separate alpha signals from execution — never place orders inside Alpha.update()
+  S2. Use CompositeAlphaModel to blend complementary strategies
+  S3. Cancel insights for removed universe members in on_securities_changed
+  S4. Match rebalance frequency to signal half-life (momentum=monthly, RSI=daily)
+  S5. Test components in isolation using Null models before full integration
+
+================================================================================
+32. SUPPLY & DEMAND ZONES — PRICE ACTION STRATEGY
+================================================================================
+
+CONCEPT:
+  Supply and Demand (S&D) is a price action strategy rooted in institutional order
+  flow. Large institutions cannot fill entire orders at once — they leave unfilled
+  orders at price levels where they previously engaged. When price returns to those
+  levels, remaining orders re-trigger, causing price to bounce.
+
+  DEMAND ZONE — Area where strong buying occurred (price left rapidly upward).
+                When price returns → buy (unfilled buy orders re-engage).
+  SUPPLY ZONE  — Area where strong selling occurred (price left rapidly downward).
+                When price returns → sell/short (unfilled sell orders re-engage).
+
+ZONE FORMATION PATTERNS:
+  Pattern                  | Meaning
+  -------------------------|----------------------------------------------------
+  Rally-Base-Rally (RBR)   | Demand zone: uptrend, tight base, uptrend continues
+  Drop-Base-Rally  (DBR)   | Demand zone: downtrend, tight base, reversal upward
+  Rally-Base-Drop  (RBD)   | Supply zone: uptrend, tight base, reversal downward
+  Drop-Base-Drop   (DBD)   | Supply zone: downtrend, tight base, downtrend continues
+
+  KEY DEFINITIONS:
+    Rally  = strong bullish move (body > 1.5× avg candle body)
+    Drop   = strong bearish move (body > 1.5× avg candle body)
+    Base   = tight consolidation (1–3 small candles, body < 50% of avg body)
+    Impulse= the candle(s) moving sharply away from the base
+
+ZONE BOUNDARIES:
+  DEMAND ZONE:
+    Top edge    = high of the highest base candle
+    Bottom edge = low of the lowest base candle
+    Stop loss   = 10–15% below bottom edge (below the zone)
+    Target      = nearest supply zone above (minimum 2:1 R:R)
+
+  SUPPLY ZONE:
+    Top edge    = high of the highest base candle
+    Bottom edge = low of the lowest base candle
+    Stop loss   = 10–15% above top edge (above the zone)
+    Target      = nearest demand zone below (minimum 2:1 R:R)
+
+ZONE QUALITY FILTERS (rank zones by these):
+  1. FRESHNESS   — Zone must be unvisited since formation (price has not re-entered)
+                   A zone is consumed once price closes inside it
+  2. IMPULSE STR — Move out of base must be > 3× height of the base itself
+  3. BASE TIGHT  — Fewer base candles = stronger (1–2 preferred, max 3)
+  4. TIME        — Older zones are weaker (prefer zones < 20 bars old for intraday,
+                   < 60 bars for daily)
+  5. HIGHER TF   — Daily zone > 4H zone > 1H zone (higher = more institutional)
+  6. VIRGIN      — First touch of a zone is highest probability; second touch weaker
+
+CODE: IDENTIFY DEMAND ZONES (daily bars)
+```python
+import numpy as np
+
+def _identify_demand_zones(self, symbol, lookback=100):
+    bars = self.history(symbol, lookback, Resolution.DAILY)
+    if bars is None or bars.empty or len(bars) < 5:
+        return []
+
+    closes = bars['close'].values
+    highs  = bars['high'].values
+    lows   = bars['low'].values
+    opens  = bars['open'].values
+    bodies = np.abs(closes - opens)
+    avg_body = np.mean(bodies)
+
+    zones = []
+    for i in range(2, len(closes) - 2):
+        body_i = bodies[i]
+
+        # Is candle i a BASE? (small body relative to average)
+        if body_i > avg_body * 0.5:
+            continue
+
+        # Is the NEXT candle(s) a strong bullish impulse?
+        impulse_body = bodies[i + 1]
+        impulse_pct  = (closes[i + 1] - opens[i + 1]) / opens[i + 1]
+
+        if impulse_pct > 0.015 and impulse_body > avg_body * 1.5:
+            zone_top    = max(opens[i], closes[i], highs[i])
+            zone_bottom = min(opens[i], closes[i], lows[i])
+            impulse_size = abs(closes[i + 1] - opens[i + 1])
+            zone_height  = zone_top - zone_bottom if zone_top > zone_bottom else 0.001
+
+            if impulse_size < zone_height * 3:
+                continue   # impulse not strong enough
+
+            # Check zone is FRESH (price never re-entered after formation)
+            future_lows = lows[i + 2:]
+            if any(l < zone_top for l in future_lows):
+                continue   # zone already consumed
+
+            zones.append({
+                'top':       zone_top,
+                'bottom':    zone_bottom,
+                'formed_idx': i,
+                'impulse':   impulse_pct,
+                'age':       len(closes) - i   # bars since zone formed
+            })
+
+    # Sort: freshest and strongest first
+    zones.sort(key=lambda z: (-z['impulse'], z['age']))
+    return zones
+
+def _identify_supply_zones(self, symbol, lookback=100):
+    bars = self.history(symbol, lookback, Resolution.DAILY)
+    if bars is None or bars.empty or len(bars) < 5:
+        return []
+
+    closes = bars['close'].values
+    highs  = bars['high'].values
+    lows   = bars['low'].values
+    opens  = bars['open'].values
+    bodies = np.abs(closes - opens)
+    avg_body = np.mean(bodies)
+
+    zones = []
+    for i in range(2, len(closes) - 2):
+        body_i = bodies[i]
+        if body_i > avg_body * 0.5:
+            continue
+
+        impulse_body = bodies[i + 1]
+        impulse_pct  = (opens[i + 1] - closes[i + 1]) / opens[i + 1]  # bearish
+
+        if impulse_pct > 0.015 and impulse_body > avg_body * 1.5:
+            zone_top    = max(opens[i], closes[i], highs[i])
+            zone_bottom = min(opens[i], closes[i], lows[i])
+            impulse_size = abs(closes[i + 1] - opens[i + 1])
+            zone_height  = zone_top - zone_bottom if zone_top > zone_bottom else 0.001
+
+            if impulse_size < zone_height * 3:
+                continue
+
+            future_highs = highs[i + 2:]
+            if any(h > zone_bottom for h in future_highs):
+                continue   # zone already consumed
+
+            zones.append({
+                'top':       zone_top,
+                'bottom':    zone_bottom,
+                'formed_idx': i,
+                'impulse':   impulse_pct,
+                'age':       len(closes) - i
+            })
+
+    zones.sort(key=lambda z: (-z['impulse'], z['age']))
+    return zones
+```
+
+CODE: ENTRY SIGNAL — PRICE AT DEMAND ZONE WITH CONFIRMATION
+```python
+def _check_sd_entry(self, symbol):
+    price  = self.securities[symbol].price
+    zones  = self._identify_demand_zones(symbol, lookback=120)
+
+    for zone in zones:
+        # Price is touching or inside demand zone
+        if zone['bottom'] * 0.99 <= price <= zone['top'] * 1.005:
+            # Confirmation: current candle closes above zone top (bounce confirmed)
+            bars = self.history(symbol, 2, Resolution.DAILY)
+            if bars is None or bars.empty:
+                return None
+            last_close = bars['close'].values[-1]
+            if last_close > zone['top']:
+                risk        = zone['top'] - zone['bottom']
+                stop_price  = zone['bottom'] - risk * 0.15
+                target_price = zone['top'] + risk * 2.5   # 2.5:1 R:R
+                return {
+                    'signal':  'LONG',
+                    'entry':   price,
+                    'stop':    stop_price,
+                    'target':  target_price,
+                    'zone':    zone
+                }
+    return None
+```
+
+CODE: POSITION SIZING FOR S&D (risk-based)
+```python
+def _sd_position_size(self, symbol, entry_price, stop_price, risk_pct=0.01):
+    # Risk 1% of portfolio per trade
+    portfolio_value = self.portfolio.total_portfolio_value
+    risk_dollars    = portfolio_value * risk_pct
+    risk_per_share  = abs(entry_price - stop_price)
+    if risk_per_share == 0:
+        return 0
+    shares = int(risk_dollars / risk_per_share)
+    # Cap at 10% portfolio weight
+    max_shares = int(portfolio_value * 0.10 / entry_price)
+    return min(shares, max_shares)
+```
+
+CODE: FULL S&D ENTRY HANDLER (call from scheduled function or on_data)
+```python
+def _scan_sd_signals(self):
+    if self.is_warming_up or self._trading_halted:
+        return
+
+    for symbol in self.active_securities.keys():
+        if symbol.security_type != SecurityType.EQUITY:
+            continue
+        if self.portfolio[symbol].invested:
+            continue   # already have a position
+
+        signal = self._check_sd_entry(symbol)
+        if not signal:
+            continue
+
+        qty = self._sd_position_size(
+            symbol, signal['entry'], signal['stop'], risk_pct=0.01)
+        if qty <= 0:
+            continue
+
+        # Entry limit order at zone top (confirmed bounce)
+        ticket = self.limit_order(
+            symbol, qty, signal['entry'] * 1.001,
+            tag=f"sd-demand-entry")
+
+        # Attach stop loss
+        stop_ticket = self.stop_market_order(
+            symbol, -qty, signal['stop'],
+            tag=f"sd-stop-loss")
+
+        # Store target for take-profit management
+        self._sd_targets[symbol] = signal['target']
+        self._sd_stops[symbol]   = stop_ticket.order_id
+
+    self.log(f"S&D scan complete — {sum(1 for h in self.portfolio.values() if h.invested)} positions")
+```
+
+CODE: TAKE-PROFIT AND ZONE INVALIDATION MANAGEMENT
+```python
+def on_data(self, slice):
+    if self.is_warming_up:
+        return
+
+    for symbol, target in list(self._sd_targets.items()):
+        if not self.portfolio[symbol].invested:
+            self._sd_targets.pop(symbol, None)
+            self._sd_stops.pop(symbol, None)
+            continue
+
+        price = self.securities[symbol].price
+
+        # Take profit at target
+        if price >= target:
+            self.liquidate(symbol, tag="sd-take-profit")
+            self._sd_targets.pop(symbol, None)
+            # Cancel associated stop order
+            stop_id = self._sd_stops.pop(symbol, None)
+            if stop_id:
+                self.transactions.cancel_order(stop_id)
+```
+
+CODE: INITIALIZE STATE FOR S&D ALGO
+```python
+def initialize(self):
+    # ... standard setup ...
+    self._sd_targets = {}   # symbol → target price
+    self._sd_stops   = {}   # symbol → stop order ID
+
+    # Daily scan: 30 min after open
+    self.schedule.on(
+        self.date_rules.every_day(self._spy),
+        self.time_rules.after_market_open(self._spy, 30),
+        self._scan_sd_signals)
+```
+
+TIMEFRAME HIERARCHY (multi-timeframe S&D):
+  Use higher timeframe zones as the filter; lower timeframe for precision entry.
+  Pattern:
+    1. Identify Daily demand zone (primary signal)
+    2. Drill into 4H bars: wait for price to tap zone and form bullish candle
+    3. Enter on 4H confirmation with Daily-level stop and target
+
+  In QuantConnect — use consolidators for 4H bars:
+```python
+from datetime import timedelta
+
+def initialize(self):
+    consolidator = TradeBarConsolidator(timedelta(hours=4))
+    consolidator.data_consolidated += self._on_4h_bar
+    self.subscription_manager.add_consolidator(symbol, consolidator)
+
+def _on_4h_bar(self, sender, bar):
+    # Check if price is at a daily demand zone and 4H bar is bullish confirmation
+    daily_zones = self._identify_demand_zones(bar.symbol, lookback=100)
+    for zone in daily_zones:
+        if zone['bottom'] <= bar.close <= zone['top'] * 1.01:
+            if bar.close > bar.open:   # 4H bullish candle inside daily zone
+                self._trigger_sd_entry(bar.symbol, zone)
+```
+
+COMBINING S&D WITH MOMENTUM (hybrid signal):
+  - Require stock to be in top-quartile momentum ranking (avoids dead stocks)
+  - Then check if price is at a fresh demand zone
+  - Only enter if BOTH conditions are met
+  - This filters out low-quality S&D setups in downtrending stocks
+
+  Score integration:
+    combined_score = 0.60 * momentum_score + 0.40 * sd_proximity_score
+    sd_proximity_score = 1.0 if price within 1% of fresh demand zone else 0.0
+
+INVALIDATION RULES (when to cancel/skip a zone):
+  - Zone is consumed: price closed INSIDE the zone without bouncing
+  - News event: earnings, FDA decision, macro shock during zone approach
+  - Spread too wide: bid/ask spread > 0.5% (indicates low liquidity at zone)
+  - Drawdown: portfolio drawdown > 8% → skip all new S&D entries (defensive mode)
+  - Age limit: zone older than 60 bars on daily → reliability degrades significantly
+
+RISK PARAMETERS FOR S&D:
+  Risk per trade     : 0.5–1.0% of portfolio per entry
+  R:R minimum        : 2:1 (target must be at least 2× the stop distance)
+  Max concurrent S&D : 5 positions (to limit correlated zone trades)
+  Zone age limit     : 60 daily bars
+  Confirmation candle: Required — do NOT enter on first touch without confirmation
+  First touch only   : Highest probability; second touch acceptable at 50% size
+
+KEY S&D RULES:
+  SD1. Never enter on first touch without confirmation — wait for a bounce candle
+  SD2. Stop goes BELOW zone (demand) or ABOVE zone (supply), never inside
+  SD3. Fresh (unvisited) zones only — consumed zones have lower probability
+  SD4. Higher timeframe zones take priority over lower timeframe zones
+  SD5. Cancel open S&D entry orders if price trades through zone without bouncing
+  SD6. Never trade S&D zones against a strong trending market (e.g., SPY trending down = avoid demand zones)
+  SD7. Only one order per zone — do not pyramid into S&D setups
+  SD8. Log zone details on every scan for debugging and audit trail
+
+
+================================================================================
+33. WYCKOFF METHOD — ACCUMULATION, DISTRIBUTION & MARKET PHASES
+================================================================================
+
+CONCEPT:
+  Developed by Richard Wyckoff (1930s). Studies the footprints of large
+  institutional operators ("Composite Man") through price and volume analysis.
+  The market moves in cycles — large players accumulate quietly, mark up prices,
+  distribute at the top, then mark down. Identifying the phase tells you whether
+  to buy, hold, or sell.
+
+THREE WYCKOFF LAWS:
+  1. Law of Supply & Demand   — Price rises when demand > supply, falls when supply > demand
+  2. Law of Cause & Effect    — The size of the subsequent move = size of the accumulation/distribution base
+                                (wider trading range = bigger markup/markdown ahead)
+  3. Law of Effort vs Result  — Volume (effort) should confirm price movement (result).
+                                Divergence = warning sign.
+                                High volume + small price move = absorption (opposing side is strong)
+                                Low volume + large price move = easy movement (no opposition)
+
+THE WYCKOFF PRICE CYCLE:
+  Accumulation → Markup → Distribution → Markdown → (repeat)
+
+  ACCUMULATION  : Institutions quietly buy from retail (sideways, choppy range)
+  MARKUP        : Price trends up; public joins late
+  DISTRIBUTION  : Institutions quietly sell to retail (sideways, choppy range at top)
+  MARKDOWN      : Price trends down; retail panics, sells to institutions again
+
+
+================================================================================
+ACCUMULATION SCHEMATIC — KEY EVENTS
+================================================================================
+
+  Event | Name                   | Description
+  ------|------------------------|--------------------------------------------------
+  PS    | Preliminary Support    | First sign of buying after downtrend; volume increases but not climactic
+  SC    | Selling Climax         | Panic selling; wide bar, high volume, closes off lows → bottoming signal
+  AR    | Automatic Rally        | Price bounces from SC; establishes top of trading range
+  ST    | Secondary Test         | Price retests SC area; LOWER volume = bullish (less supply)
+  JAC   | Jump Across the Creek  | Price breaks above AR on high volume (creek = resistance)
+  Spring| Spring                 | Price briefly dips BELOW SC/PS (shakes out weak hands), then recovers quickly
+  LPS   | Last Point of Support  | Higher low after Spring; reduced supply; re-entry point
+  SOS   | Sign of Strength       | Strong rally on HIGH volume, breaks through AR — markup about to begin
+  BU    | Back Up (to the Edge)  | Price returns to broken resistance (now support) before final markup
+
+  ACCUMULATION SEQUENCE:
+    PS → SC → AR → ST → (Spring) → LPS → SOS → BU → Markup
+
+  TRADING SIGNALS FROM ACCUMULATION:
+    BUY 1: Spring + recovery on lower volume (trap confirmed)
+    BUY 2: LPS (higher low on low volume) — conservative entry
+    BUY 3: SOS breakout above AR on high volume — aggressive entry
+    BUY 4: BU pullback to former resistance — lowest risk entry, highest probability
+
+
+================================================================================
+DISTRIBUTION SCHEMATIC — KEY EVENTS
+================================================================================
+
+  Event | Name                      | Description
+  ------|---------------------------|--------------------------------------------------
+  PSY   | Preliminary Supply        | First resistance after uptrend; increased volume
+  BC    | Buying Climax             | Euphoric buying; wide bar, high volume, closes off highs → topping signal
+  AR    | Automatic Reaction        | Price drops from BC; establishes bottom of trading range
+  ST    | Secondary Test            | Price retests BC area on LOWER volume = bearish (less demand)
+  SOW   | Sign of Weakness          | Down move on HIGH volume, breaks through AR — markdown imminent
+  LPSY  | Last Point of Supply      | Lower high on weak volume (weak bounce) — short entry
+  UTAD  | Upthrust After Dist.      | Fake breakout ABOVE BC to trap late longs before markdown
+
+  DISTRIBUTION SEQUENCE:
+    PSY → BC → AR → ST → (UTAD) → SOW → LPSY → Markdown
+
+  TRADING SIGNALS FROM DISTRIBUTION:
+    SHORT 1: UTAD + rejection candle (fake breakout trap)
+    SHORT 2: LPSY (lower high on weak volume) — conservative short entry
+    SHORT 3: SOW breakdown below AR on high volume — aggressive short
+    SHORT 4: Rally back to AR (now resistance) — lowest risk short
+
+
+================================================================================
+VOLUME SPREAD ANALYSIS (VSA) — READING WYCKOFF WITH VOLUME
+================================================================================
+
+  Pattern                  | Price Spread | Volume  | Meaning
+  -------------------------|--------------|---------|---------------------------
+  Selling Climax           | Wide down    | Very Hi | Institutions absorbing supply (bullish)
+  Buying Climax            | Wide up      | Very Hi | Institutions distributing (bearish)
+  No Supply                | Narrow down  | Low     | Sellers exhausted → bullish
+  No Demand                | Narrow up    | Low     | Buyers exhausted → bearish
+  Effort to Rise           | Wide up      | High    | Demand in control (bullish)
+  Effort to Fall           | Wide down    | High    | Supply in control (bearish)
+  Absorption (Accumulation)| Narrow       | High    | Selling absorbed by institutions (bullish)
+  Absorption (Distribution)| Narrow       | High    | Buying absorbed by institutions (bearish)
+  Stopping Volume          | Down bar     | Very Hi | Climactic selling — bottom near
+  Upthrust                 | Up bar       | Low     | Weak breakout → reversal likely
+
+  RULE: Volume confirms direction.
+    - High volume on advance = healthy trend
+    - High volume on decline into accumulation = climactic (bullish reversal)
+    - Low volume on advance near resistance = no demand (distribution warning)
+    - Low volume on decline after breakout = no supply (markup continuation)
+
+
+================================================================================
+CODE: WYCKOFF PHASE DETECTION
+================================================================================
+
+  HELPER — DETECT SELLING CLIMAX (SC):
+```python
+def _detect_selling_climax(self, bars, lookback=20):
+    closes  = bars['close'].values
+    lows    = bars['low'].values
+    highs   = bars['high'].values
+    opens   = bars['open'].values
+    volumes = bars['volume'].values
+    bodies  = np.abs(closes - opens)
+    avg_vol  = np.mean(volumes[-lookback:])
+    avg_body = np.mean(bodies[-lookback:])
+
+    events = []
+    for i in range(lookback, len(closes)):
+        is_down_bar   = closes[i] < opens[i]
+        wide_spread   = bodies[i] > avg_body * 2.0
+        high_volume   = volumes[i] > avg_vol * 2.0
+        closes_off_low = (closes[i] - lows[i]) > bodies[i] * 0.3  # not at the low
+
+        if is_down_bar and wide_spread and high_volume and closes_off_low:
+            events.append({
+                'type':  'SC',
+                'index': i,
+                'price': closes[i],
+                'volume': volumes[i]
+            })
+    return events
+```
+
+  HELPER — DETECT SPRING (price dips below support then recovers):
+```python
+def _detect_spring(self, bars, support_level, tolerance=0.005):
+    lows   = bars['low'].values
+    closes = bars['close'].values
+    volumes= bars['volume'].values
+    avg_vol = np.mean(volumes)
+
+    events = []
+    for i in range(1, len(lows)):
+        # Dipped below support
+        if lows[i] < support_level * (1 - tolerance):
+            # Recovered above support by close
+            if closes[i] > support_level * (1 - tolerance):
+                # Volume moderate (not a new panic)
+                if volumes[i] < avg_vol * 1.5:
+                    events.append({
+                        'type':  'Spring',
+                        'index': i,
+                        'low':   lows[i],
+                        'close': closes[i]
+                    })
+    return events
+```
+
+  HELPER — DETECT SIGN OF STRENGTH (SOS): Strong up move on high volume
+```python
+def _detect_sos(self, bars, resistance_level, lookback=20):
+    closes  = bars['close'].values
+    opens   = bars['open'].values
+    volumes = bars['volume'].values
+    bodies  = np.abs(closes - opens)
+    avg_vol  = np.mean(volumes[-lookback:])
+    avg_body = np.mean(bodies[-lookback:])
+
+    events = []
+    for i in range(lookback, len(closes)):
+        is_up_bar    = closes[i] > opens[i]
+        wide_spread  = bodies[i] > avg_body * 1.5
+        high_volume  = volumes[i] > avg_vol * 1.5
+        breaks_res   = closes[i] > resistance_level  # breaks above AR
+
+        if is_up_bar and wide_spread and high_volume and breaks_res:
+            events.append({
+                'type':  'SOS',
+                'index': i,
+                'price': closes[i],
+                'volume': volumes[i]
+            })
+    return events
+```
+
+  HELPER — DETECT BUYING CLIMAX (BC):
+```python
+def _detect_buying_climax(self, bars, lookback=20):
+    closes  = bars['close'].values
+    highs   = bars['high'].values
+    opens   = bars['open'].values
+    volumes = bars['volume'].values
+    bodies  = np.abs(closes - opens)
+    avg_vol  = np.mean(volumes[-lookback:])
+    avg_body = np.mean(bodies[-lookback:])
+
+    events = []
+    for i in range(lookback, len(closes)):
+        is_up_bar     = closes[i] > opens[i]
+        wide_spread   = bodies[i] > avg_body * 2.0
+        high_volume   = volumes[i] > avg_vol * 2.0
+        closes_off_hi = (highs[i] - closes[i]) > bodies[i] * 0.3  # not at the high
+
+        if is_up_bar and wide_spread and high_volume and closes_off_hi:
+            events.append({
+                'type':  'BC',
+                'index': i,
+                'price': closes[i],
+                'volume': volumes[i]
+            })
+    return events
+```
+
+  HELPER — DETECT UPTHRUST (UTAD): Fake breakout above resistance, quick rejection
+```python
+def _detect_upthrust(self, bars, resistance_level, tolerance=0.005):
+    highs  = bars['high'].values
+    closes = bars['close'].values
+    volumes= bars['volume'].values
+    avg_vol = np.mean(volumes)
+
+    events = []
+    for i in range(1, len(highs)):
+        # Poked above resistance
+        if highs[i] > resistance_level * (1 + tolerance):
+            # But closed BACK BELOW resistance (rejection)
+            if closes[i] < resistance_level:
+                # Volume moderate-high (but not climactic — if climactic it's a BC)
+                if volumes[i] > avg_vol * 0.8:
+                    events.append({
+                        'type':  'UTAD',
+                        'index': i,
+                        'high':  highs[i],
+                        'close': closes[i]
+                    })
+    return events
+```
+
+
+================================================================================
+CODE: WYCKOFF PHASE CLASSIFIER
+================================================================================
+
+```python
+def _classify_wyckoff_phase(self, symbol, lookback=150):
+    bars = self.history(symbol, lookback, Resolution.DAILY)
+    if bars is None or bars.empty or len(bars) < 50:
+        return 'UNKNOWN'
+
+    closes  = bars['close'].values
+    volumes = bars['volume'].values
+
+    # Identify recent trading range (last 60 bars)
+    recent_hi = np.max(closes[-60:])
+    recent_lo = np.min(closes[-60:])
+    range_pct  = (recent_hi - recent_lo) / recent_lo
+
+    current = closes[-1]
+
+    # Must be in a trading range (not a strong trend)
+    if range_pct < 0.05:
+        return 'TIGHT_RANGE'   # too tight for Wyckoff analysis
+
+    # Detect key events
+    sc_events  = self._detect_selling_climax(bars, lookback=60)
+    bc_events  = self._detect_buying_climax(bars, lookback=60)
+    spring_evt = self._detect_spring(bars, support_level=recent_lo)
+    sos_events = self._detect_sos(bars, resistance_level=recent_hi, lookback=60)
+    ut_events  = self._detect_upthrust(bars, resistance_level=recent_hi)
+
+    # Determine phase
+    has_sc      = len(sc_events) > 0
+    has_bc      = len(bc_events) > 0
+    has_spring  = len(spring_evt) > 0
+    has_sos     = len(sos_events) > 0
+    has_utad    = len(ut_events) > 0
+
+    # Price position within range
+    pos_in_range = (current - recent_lo) / (recent_hi - recent_lo)
+
+    if has_sc and not has_sos:
+        if has_spring:
+            return 'ACCUMULATION_SPRING'   # Phase C — strong buy setup
+        elif pos_in_range < 0.35:
+            return 'ACCUMULATION_EARLY'    # Phase B — wait
+        else:
+            return 'ACCUMULATION_LATE'     # Phase C/D — LPS area
+
+    elif has_sos:
+        if pos_in_range > 0.85:
+            return 'MARKUP'               # Trend started
+        else:
+            return 'ACCUMULATION_SOS'     # BU opportunity
+
+    elif has_bc and not has_utad:
+        if pos_in_range > 0.65:
+            return 'DISTRIBUTION_EARLY'   # Phase B — wait
+        else:
+            return 'DISTRIBUTION_LATE'    # Phase C/D — LPSY area
+
+    elif has_utad:
+        return 'DISTRIBUTION_UTAD'        # Short opportunity
+
+    return 'TRENDING_OR_UNKNOWN'
+```
+
+
+================================================================================
+CODE: WYCKOFF TRADING SIGNALS IN QUANTCONNECT
+================================================================================
+
+```python
+def _wyckoff_signal(self, symbol):
+    phase = self._classify_wyckoff_phase(symbol)
+
+    bars    = self.history(symbol, 150, Resolution.DAILY)
+    closes  = bars['close'].values
+    recent_hi = np.max(closes[-60:])
+    recent_lo = np.min(closes[-60:])
+    current   = self.securities[symbol].price
+
+    if phase == 'ACCUMULATION_SPRING':
+        # Spring confirmed — strong buy
+        stop   = recent_lo * 0.97          # 3% below the spring low
+        target = recent_hi * 1.05          # above the trading range
+        return {'direction': 'LONG', 'stop': stop, 'target': target, 'phase': phase}
+
+    elif phase == 'ACCUMULATION_SOS':
+        # Back Up to broken resistance — buy the dip
+        stop   = (recent_lo + recent_hi) / 2  # mid-range support
+        target = recent_hi * 1.10
+        return {'direction': 'LONG', 'stop': stop, 'target': target, 'phase': phase}
+
+    elif phase == 'ACCUMULATION_LATE':
+        # LPS — conservative long near support
+        stop   = recent_lo * 0.97
+        target = recent_hi
+        return {'direction': 'LONG', 'stop': stop, 'target': target, 'phase': phase}
+
+    elif phase == 'DISTRIBUTION_UTAD':
+        # Upthrust — short opportunity
+        stop   = recent_hi * 1.03
+        target = recent_lo * 0.95
+        return {'direction': 'SHORT', 'stop': stop, 'target': target, 'phase': phase}
+
+    elif phase == 'DISTRIBUTION_LATE':
+        # LPSY — short on weak rally
+        stop   = recent_hi * 1.02
+        target = recent_lo * 0.97
+        return {'direction': 'SHORT', 'stop': stop, 'target': target, 'phase': phase}
+
+    return None   # No signal
+
+def _scan_wyckoff_signals(self):
+    if self.is_warming_up or self._trading_halted:
+        return
+
+    for symbol in self.active_securities.keys():
+        if symbol.security_type != SecurityType.EQUITY:
+            continue
+        if self.portfolio[symbol].invested:
+            continue
+
+        signal = self._wyckoff_signal(symbol)
+        if not signal or signal['direction'] != 'LONG':
+            continue
+
+        entry = self.securities[symbol].price
+        stop  = signal['stop']
+        risk_per_share = abs(entry - stop)
+        if risk_per_share == 0:
+            continue
+
+        risk_dollars = self.portfolio.total_portfolio_value * 0.01
+        qty = int(risk_dollars / risk_per_share)
+        max_qty = int(self.portfolio.total_portfolio_value * 0.10 / entry)
+        qty = min(qty, max_qty)
+        if qty <= 0:
+            continue
+
+        self.market_order(symbol, qty, tag=f"wyckoff-{signal['phase']}")
+        self._wyckoff_stops[symbol]   = stop
+        self._wyckoff_targets[symbol] = signal['target']
+        self.log(f"Wyckoff LONG {symbol} | Phase={signal['phase']} "
+                 f"| Entry={entry:.2f} Stop={stop:.2f} Target={signal['target']:.2f}")
+```
+
+INITIALIZE WYCKOFF STATE:
+```python
+def initialize(self):
+    # ... standard setup ...
+    self._wyckoff_stops   = {}   # symbol → stop price
+    self._wyckoff_targets = {}   # symbol → target price
+
+    # Weekly scan (Wyckoff is a slower, structural approach)
+    self.schedule.on(
+        self.date_rules.week_start(self._spy),
+        self.time_rules.after_market_open(self._spy, 30),
+        self._scan_wyckoff_signals)
+```
+
+WYCKOFF + VOLUME CONFIRMATION (integrate VSA in signal):
+```python
+def _vsa_confirmation(self, bars, direction='LONG'):
+    closes  = bars['close'].values[-5:]
+    opens   = bars['open'].values[-5:]
+    volumes = bars['volume'].values[-5:]
+    avg_vol = np.mean(bars['volume'].values[-20:])
+
+    if direction == 'LONG':
+        # Look for No Supply: narrow spread, low volume on last down bar
+        for i in range(len(closes)):
+            is_down = closes[i] < opens[i]
+            narrow  = abs(closes[i] - opens[i]) < np.mean(np.abs(bars['close'].values - bars['open'].values)) * 0.5
+            low_vol = volumes[i] < avg_vol * 0.7
+            if is_down and narrow and low_vol:
+                return True   # No supply present — bullish VSA confirmation
+
+    elif direction == 'SHORT':
+        # Look for No Demand: narrow spread, low volume on last up bar
+        for i in range(len(closes)):
+            is_up   = closes[i] > opens[i]
+            narrow  = abs(closes[i] - opens[i]) < np.mean(np.abs(bars['close'].values - bars['open'].values)) * 0.5
+            low_vol = volumes[i] < avg_vol * 0.7
+            if is_up and narrow and low_vol:
+                return True   # No demand present — bearish VSA confirmation
+
+    return False
+```
+
+
+================================================================================
+WYCKOFF + SUPPLY & DEMAND INTEGRATION
+================================================================================
+
+  Wyckoff and S&D are complementary:
+    - S&D identifies the ZONE (where price is likely to react)
+    - Wyckoff identifies the PHASE (whether to buy or wait at that zone)
+
+  Combined logic:
+    1. Find a fresh S&D demand zone
+    2. Confirm the underlying stock is in Wyckoff ACCUMULATION phase
+    3. Enter on Spring or LPS event at or near the demand zone
+    4. Volume must confirm (No Supply or Stopping Volume on approach)
+
+```python
+def _sd_wyckoff_combined_signal(self, symbol):
+    # Check S&D zone proximity
+    price     = self.securities[symbol].price
+    sd_zones  = self._identify_demand_zones(symbol, lookback=120)
+    near_zone = any(z['bottom'] * 0.99 <= price <= z['top'] * 1.01 for z in sd_zones)
+
+    if not near_zone:
+        return None
+
+    # Check Wyckoff phase is accumulation
+    phase = self._classify_wyckoff_phase(symbol)
+    if phase not in ('ACCUMULATION_SPRING', 'ACCUMULATION_LATE', 'ACCUMULATION_SOS'):
+        return None
+
+    # Volume confirmation (No Supply)
+    bars = self.history(symbol, 25, Resolution.DAILY)
+    vsa_ok = self._vsa_confirmation(bars, direction='LONG')
+    if not vsa_ok:
+        return None
+
+    # All three align — high-probability entry
+    best_zone = sd_zones[0]
+    return {
+        'direction': 'LONG',
+        'stop':   best_zone['bottom'] * 0.97,
+        'target': best_zone['top'] + (best_zone['top'] - best_zone['bottom']) * 2.5,
+        'phase':  phase,
+        'confidence': 'HIGH'
+    }
+```
+
+
+================================================================================
+WYCKOFF KEY RULES SUMMARY
+================================================================================
+
+  W1.  NEVER buy in a distribution range — wait for markdown, then accumulation
+  W2.  NEVER short in an accumulation range — wait for markup, then distribution
+  W3.  Spring is the HIGHEST probability long entry — but wait for recovery confirmation
+  W4.  UTAD is the highest probability short entry — wait for close back below resistance
+  W5.  Volume MUST confirm the phase interpretation — no volume = no conviction
+  W6.  Cause (range width) determines Effect (move size) — wider base = bigger trend
+  W7.  LPS and LPSY are the safest re-entry points (lower risk, confirmed direction)
+  W8.  Do NOT trade in Phase B (middle of accumulation/distribution) — just observe
+  W9.  Use weekly chart for phase, daily for entry, 4H for precision timing
+  W10. Combine with VSA: No Supply before SOS = highest conviction buy setup
+
+  WYCKOFF PHASE CHEAT SHEET:
+    Phase A — Stopping of prior trend (PS, SC, AR)
+    Phase B — Building the cause (STs, range trading)
+    Phase C — Test of supply/demand (Spring or UTAD) ← BEST ENTRY POINT
+    Phase D — Trend resumes (SOS, LPS or SOW, LPSY) ← SECOND ENTRY POINT
+    Phase E — Full markup/markdown (price leaves the range)
+
+
+================================================================================
+END OF NOTES
+================================================================================

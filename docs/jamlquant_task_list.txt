@@ -1,0 +1,730 @@
+================================================================================
+JAMLQUANT — FULL ALGORITHM BUILD TASK LIST
+================================================================================
+Project  : Adaptive Multi-Factor Momentum with Risk Overlay (AMMRO)
+Platform : QuantConnect / LEAN Engine (Python 3.11)
+Author   : JamlQuant
+Date     : 2026-05-03
+--------------------------------------------------------------------------------
+LEGEND:
+  [ ] = Not started
+  [x] = Complete
+--------------------------------------------------------------------------------
+NOTE: Work through phases in order. Do not begin Phase N+1 until all tasks
+      in Phase N are marked complete and the phase gate test passes.
+================================================================================
+
+
+================================================================================
+PHASE 0 — ENVIRONMENT & PROJECT SETUP
+================================================================================
+
+  [ ] 0.1   Create QuantConnect account at quantconnect.com
+  [ ] 0.2   Create new Algorithm project in QuantConnect Cloud IDE
+  [ ] 0.3   Name project: "AMMRO-v1"
+  [ ] 0.4   Set Python language in project settings
+  [ ] 0.5   Verify LEAN version (target: latest stable)
+  [ ] 0.6   Create local project folder: jamlquantconnect/algo/
+  [ ] 0.7   Copy docs folder references into project notes
+  [ ] 0.8   Set up version control (git init in project folder)
+  [ ] 0.9   Create main algorithm file: ammro_algorithm.py
+  [ ] 0.10  Confirm AlgorithmImports import resolves without error
+  [ ] 0.11  Run empty QCAlgorithm skeleton — confirm zero errors in backtest log
+
+  PHASE 0 GATE: Empty skeleton compiles and runs without errors.
+
+
+================================================================================
+PHASE 1 — SKELETON & INITIALIZE()
+================================================================================
+
+  [ ] 1.1   Define AMMROAlgorithm(QCAlgorithm) class
+  [ ] 1.2   Add all class-level constants (parameters) at top of class
+              - Universe: UNIVERSE_SIZE, MIN_PRICE, MIN_DOLLAR_VOL, MIN_MARKET_CAP
+              - Alpha: MOMENTUM_LOOKBACK, MOMENTUM_SKIP, RSI_PERIOD, RSI_OVERBOUGHT
+              - PCM: TOP_N, EQUITY_SLEEVE, CRYPTO_SLEEVE, VOL_LOOKBACK, POSITION_CAP, SECTOR_CAP
+              - Risk: HARD_STOP, TRAILING_STOP, TAKE_PROFIT, DEFENSIVE_DD, HALT_DD, RECOVERY_DD
+              - Crypto: FUNDING_HI, FUNDING_LO, FUNDING_MIN_PERIODS
+              - Blending: W_MOMENTUM, W_QUALITY, W_RSI
+  [ ] 1.3   Implement initialize():
+              [ ] 1.3.1  set_start_date(2015, 1, 1)
+              [ ] 1.3.2  set_end_date(2024, 12, 31)
+              [ ] 1.3.3  set_cash(100_000)
+              [ ] 1.3.4  set_brokerage_model(INTERACTIVE_BROKERS, MARGIN)
+              [ ] 1.3.5  settings.free_portfolio_value_percentage = 0.05
+              [ ] 1.3.6  set_benchmark("SPY")
+              [ ] 1.3.7  universe_settings.resolution = Resolution.DAILY
+              [ ] 1.3.8  universe_settings.asynchronous = True
+              [ ] 1.3.9  add_universe(self._fundamental_filter)
+              [ ] 1.3.10 add_equity("SPY") → store self._spy
+              [ ] 1.3.11 add_index("VIX") → store self._vix
+              [ ] 1.3.12 add_crypto_future("BTCUSDT", DAILY, Market.BINANCE) → self._btc
+              [ ] 1.3.13 store self._btc_lot_size from symbol_properties
+              [ ] 1.3.14 initialize Minimum(10) indicator → self._funding_min
+              [ ] 1.3.15 initialize all per-security state dicts:
+                           self._rsi = {}
+                           self._atr = {}
+                           self._entry_price = {}
+                           self._peak_price = {}
+                           self._entry_time = {}
+                           self._tp_taken = set()
+              [ ] 1.3.16 initialize portfolio risk state:
+                           self._peak_value = self.portfolio.total_portfolio_value
+                           self._trading_halted = False
+                           self._defensive_mode = False
+              [ ] 1.3.17 initialize score cache:
+                           self._score_cache = {}
+                           self._score_cache_date = None
+              [ ] 1.3.18 initialize audit trail: self._audit = []
+              [ ] 1.3.19 set_warm_up(280, Resolution.DAILY)
+              [ ] 1.3.20 schedule monthly rebalance: month_start + 30min
+              [ ] 1.3.21 schedule daily risk check: every_day + 15min
+              [ ] 1.3.22 schedule daily log: every_day, before_market_close − 5min
+  [ ] 1.4   Confirm initialize() compiles and runs without error
+
+  PHASE 1 GATE: initialize() executes cleanly; all state variables initialized.
+
+
+================================================================================
+PHASE 2 — DATA LAYER
+================================================================================
+
+  [ ] 2.1   Implement _safe_history(symbol, periods, resolution)
+              [ ] 2.1.1  Wrap self.history() in try/except
+              [ ] 2.1.2  Return None if bars is None or empty
+              [ ] 2.1.3  Return None if len(bars) < periods * 0.8
+              [ ] 2.1.4  Log error message on exception
+  [ ] 2.2   Implement _safe_rsi(symbol)
+              [ ] 2.2.1  Return None if indicator not in self._rsi
+              [ ] 2.2.2  Return None if not .is_ready
+              [ ] 2.2.3  Return .current.value otherwise
+  [ ] 2.3   Implement _safe_price(symbol)
+              [ ] 2.3.1  Return None if symbol not in self.securities
+              [ ] 2.3.2  Return None if price <= 0
+  [ ] 2.4   Implement on_securities_changed(changes)
+              [ ] 2.4.1  Loop added_securities: create RSI(14) per equity
+              [ ] 2.4.2  Loop added_securities: create ATR(14) per equity
+              [ ] 2.4.3  Skip SPY and non-equity symbols in added loop
+              [ ] 2.4.4  Loop removed_securities: deregister_indicator(RSI)
+              [ ] 2.4.5  Loop removed_securities: deregister_indicator(ATR)
+              [ ] 2.4.6  Loop removed_securities: liquidate if invested
+              [ ] 2.4.7  Loop removed_securities: call _clear_position_state()
+              [ ] 2.4.8  Wrap entire method body in try/except — log on error
+  [ ] 2.5   Implement _record_entry(symbol, fill_price)
+              [ ] 2.5.1  Set _entry_price[symbol] = fill_price
+              [ ] 2.5.2  Set _peak_price[symbol] = fill_price
+              [ ] 2.5.3  Set _entry_time[symbol] = self.time
+              [ ] 2.5.4  Discard symbol from _tp_taken
+  [ ] 2.6   Implement _clear_position_state(symbol)
+              [ ] 2.6.1  Pop symbol from _entry_price (safe)
+              [ ] 2.6.2  Pop symbol from _peak_price (safe)
+              [ ] 2.6.3  Pop symbol from _entry_time (safe)
+              [ ] 2.6.4  Discard symbol from _tp_taken
+  [ ] 2.7   Implement _audit_event(event_type, details)
+              [ ] 2.7.1  Append dict with time, type, **details to self._audit
+              [ ] 2.7.2  Trim list to last 500 entries
+  [ ] 2.8   Test: add a print in on_securities_changed and confirm securities are added/removed in log
+
+  PHASE 2 GATE: on_securities_changed fires; RSI/ATR created for added securities.
+
+
+================================================================================
+PHASE 3 — UNIVERSE SELECTION
+================================================================================
+
+  [ ] 3.1   Implement _fundamental_filter(fundamental)
+              [ ] 3.1.1  Filter: f.has_fundamental_data
+              [ ] 3.1.2  Filter: f.price > MIN_PRICE
+              [ ] 3.1.3  Filter: f.dollar_volume > MIN_DOLLAR_VOL
+              [ ] 3.1.4  Filter: f.market_cap > MIN_MARKET_CAP
+              [ ] 3.1.5  Filter: sector != MorningstarSectorCode.FINANCIAL_SERVICES
+              [ ] 3.1.6  Sort filtered by dollar_volume descending
+              [ ] 3.1.7  Return top UNIVERSE_SIZE symbols
+              [ ] 3.1.8  Method is a pure function (no state mutation, no logging)
+  [ ] 3.2   Verify universe is non-empty after warm-up in backtest log
+  [ ] 3.3   Verify on_securities_changed receives added/removed securities
+  [ ] 3.4   Confirm RSI/ATR indicators are created for universe members
+  [ ] 3.5   Log universe size at first rebalance to confirm filter is working
+
+  PHASE 3 GATE: Universe selects 200–500 liquid equities; indicators created per symbol.
+
+
+================================================================================
+PHASE 4 — ALPHA / SIGNAL GENERATION
+================================================================================
+
+  [ ] 4.1   Implement _normalize(raw_dict) helper
+              [ ] 4.1.1  Handle empty dict → return {}
+              [ ] 4.1.2  Handle all-same values (span=0) → return dict of 0.5
+              [ ] 4.1.3  Return {k: (v-lo)/span for k,v in d.items()}
+  [ ] 4.2   Implement _momentum_scores()
+              [ ] 4.2.1  Loop active_securities (equity only, skip SPY)
+              [ ] 4.2.2  Fetch 280-day history via _safe_history()
+              [ ] 4.2.3  Skip symbol if bars is None or len < 252
+              [ ] 4.2.4  Compute momentum = closes[-22] / closes[0] − 1
+              [ ] 4.2.5  Store in momentum_raw dict
+              [ ] 4.2.6  Wrap per-symbol logic in try/except — continue on error
+              [ ] 4.2.7  Return raw dict (not normalized — normalization in caller)
+  [ ] 4.3   Implement _quality_scores()
+              [ ] 4.3.1  Loop active_securities (equity only)
+              [ ] 4.3.2  Skip if fundamentals is None
+              [ ] 4.3.3  Read ROE: operation_ratios.roe.one_year (default 0.0)
+              [ ] 4.3.4  Read D/E: operation_ratios.long_term_debt_equity_ratio.value
+              [ ] 4.3.5  Compute quality = ROE − max(0, D/E − 1.0) * QUALITY_DE_PENALTY
+              [ ] 4.3.6  Wrap in try/except — default to 0.0 on error
+              [ ] 4.3.7  Return raw dict
+  [ ] 4.4   Implement _rsi_scores()
+              [ ] 4.4.1  Loop active_securities (equity only)
+              [ ] 4.4.2  Read RSI via _safe_rsi(symbol)
+              [ ] 4.4.3  If None → rsi_score = 0.5 (neutral)
+              [ ] 4.4.4  If RSI_IDEAL_LO <= rsi <= RSI_IDEAL_HI → score = 1.0
+              [ ] 4.4.5  If rsi < RSI_IDEAL_LO → score = 0.5 (valid but early)
+              [ ] 4.4.6  If rsi > RSI_IDEAL_HI → score = 0.0 (overbought gate)
+              [ ] 4.4.7  Return dict (already [0,1] — no normalization needed)
+  [ ] 4.5   Implement _compute_scores()
+              [ ] 4.5.1  Call _momentum_scores(), _quality_scores(), _rsi_scores()
+              [ ] 4.5.2  Normalize momentum and quality via _normalize()
+              [ ] 4.5.3  Take intersection of all three score dicts (symbols in all three)
+              [ ] 4.5.4  Blend: W_MOMENTUM * m + W_QUALITY * q + W_RSI * r
+              [ ] 4.5.5  Return composite dict
+  [ ] 4.6   Implement score caching
+              [ ] 4.6.1  Check self._score_cache_date == self.time.month
+              [ ] 4.6.2  If stale: recompute and update cache + cache date
+              [ ] 4.6.3  If fresh: return cached dict directly
+  [ ] 4.7   Verify scores are reasonable: log top-5 and bottom-5 at first rebalance
+  [ ] 4.8   Confirm no score exceeds 1.0 or goes below 0.0
+
+  PHASE 4 GATE: Composite scores computed for all universe members; top-25 identifiable.
+
+
+================================================================================
+PHASE 5 — PORTFOLIO CONSTRUCTION
+================================================================================
+
+  [ ] 5.1   Implement _get_sector(symbol) helper
+              [ ] 5.1.1  Read morningstar_sector_code from fundamentals
+              [ ] 5.1.2  Wrap in try/except — return −1 on error
+  [ ] 5.2   Implement _apply_sector_caps(weights, cap=SECTOR_CAP)
+              [ ] 5.2.1  Sum weights per sector
+              [ ] 5.2.2  For any sector total > cap: scale its members' weights down
+              [ ] 5.2.3  Return adjusted dict
+  [ ] 5.3   Implement _build_weights(scores, defensive_mode, top_n, equity_sleeve, position_cap, sector_cap)
+              [ ] 5.3.1  Sort scores descending; take top_n
+              [ ] 5.3.2  For each top symbol: fetch 60-day history via _safe_history()
+              [ ] 5.3.3  Compute 60-day realized vol: std(daily returns)
+              [ ] 5.3.4  Skip symbol if vol = 0 or history unavailable
+              [ ] 5.3.5  Compute inv_vol_sum = sum(1/vol for all selected)
+              [ ] 5.3.6  Raw weight = (1/vol) / inv_vol_sum × equity_sleeve
+              [ ] 5.3.7  Cap each weight at position_cap
+              [ ] 5.3.8  Apply sector caps via _apply_sector_caps()
+              [ ] 5.3.9  If defensive_mode: halve all weights
+              [ ] 5.3.10 Return final weight dict
+  [ ] 5.4   Implement _needs_rebalance(target_weights) for drift detection
+              [ ] 5.4.1  For each invested symbol: compute current weight vs target
+              [ ] 5.4.2  Return True if drift > 3% for any position
+  [ ] 5.5   Verify weights sum <= EQUITY_SLEEVE at all times
+  [ ] 5.6   Verify no single weight > POSITION_CAP
+  [ ] 5.7   Verify no sector total > SECTOR_CAP
+  [ ] 5.8   Log weight table at first rebalance: symbol, vol, raw weight, final weight
+
+  PHASE 5 GATE: 20–25 inverse-vol weights produced; sum ≤ 0.85; all caps respected.
+
+
+================================================================================
+PHASE 6 — PRE-TRADE RISK GATE
+================================================================================
+
+  [ ] 6.1   Implement _pre_trade_gate(weights)
+              [ ] 6.1.1  If _trading_halted → log + return {}
+              [ ] 6.1.2  If is_warming_up → return {}
+              [ ] 6.1.3  Compute current drawdown from _peak_value
+              [ ] 6.1.4  If drawdown >= HALT_DD → log + return {}
+              [ ] 6.1.5  If drawdown >= DEFENSIVE_DD → halve all weights; log
+              [ ] 6.1.6  Re-apply position_cap as double-check
+              [ ] 6.1.7  Return approved weight dict
+  [ ] 6.2   Verify gate blocks all orders when _trading_halted = True
+  [ ] 6.3   Verify gate halves weights when drawdown at 8%
+  [ ] 6.4   Verify gate returns {} when drawdown at 12%
+
+  PHASE 6 GATE: Gate correctly blocks, reduces, or passes weights per scenario.
+
+
+================================================================================
+PHASE 7 — EXECUTION LAYER
+================================================================================
+
+  [ ] 7.1   Implement _execute_rebalance(weights)
+              [ ] 7.1.1  Call _pre_trade_gate(weights) → approved
+              [ ] 7.1.2  If approved empty → log skipped + return
+              [ ] 7.1.3  Build list of PortfolioTarget objects
+              [ ] 7.1.4  Call set_holdings(targets, liquidate_existing_holdings=True)
+              [ ] 7.1.5  Log: date, number of positions, defensive mode flag
+  [ ] 7.2   Implement _monthly_rebalance() (scheduled handler)
+              [ ] 7.2.1  Guard: if is_warming_up → return
+              [ ] 7.2.2  Guard: if _trading_halted → log + return
+              [ ] 7.2.3  Log rebalance header with date and portfolio value
+              [ ] 7.2.4  Call _compute_scores() (uses cache)
+              [ ] 7.2.5  Call _build_weights(scores, ...)
+              [ ] 7.2.6  Call _execute_rebalance(weights)
+              [ ] 7.2.7  Call _audit_event("rebalance", {...})
+  [ ] 7.3   Implement on_order_event(order_event)
+              [ ] 7.3.1  On FILLED: log symbol, tag, qty, fill price, fee
+              [ ] 7.3.2  On FILLED + "entry" or "rebalance" in tag: call _record_entry()
+              [ ] 7.3.3  On FILLED + "stop"/"exit"/"halt"/"neutral" in tag: call _clear_position_state()
+              [ ] 7.3.4  On INVALID: log symbol + message
+              [ ] 7.3.5  On CANCELED: log symbol + tag
+  [ ] 7.4   Verify orders are placed on rebalance day in backtest log
+  [ ] 7.5   Verify order tags appear correctly in backtest order events
+  [ ] 7.6   Verify liquidate_existing_holdings removes prior positions
+
+  PHASE 7 GATE: Monthly rebalance places orders; fills logged; tags correct.
+
+
+================================================================================
+PHASE 8 — ON_DATA: TRAILING STOPS & TAKE-PROFIT
+================================================================================
+
+  [ ] 8.1   Implement on_data(slice)
+              [ ] 8.1.1  Guard: if is_warming_up → return
+              [ ] 8.1.2  Update _peak_value = max(_peak_value, portfolio.total_portfolio_value)
+              [ ] 8.1.3  Loop list(_peak_price.keys()) — never iterate dict directly
+              [ ] 8.1.4  If symbol not invested → _clear_position_state() + continue
+              [ ] 8.1.5  Get current price via _safe_price()
+              [ ] 8.1.6  Update _peak_price[symbol] = max(peak, current price)
+              [ ] 8.1.7  Trailing stop: if price < _peak_price * TRAILING_STOP
+                            → liquidate(symbol, tag="trailing-stop-10pct")
+                            → _clear_position_state(symbol)
+              [ ] 8.1.8  Hard stop: if price < _entry_price * HARD_STOP
+                            → liquidate(symbol, tag="stop-loss-7pct")
+                            → _clear_position_state(symbol)
+              [ ] 8.1.9  Take profit: if unrealized_profit_percent > TAKE_PROFIT
+                          and symbol not in _tp_taken
+                            → set_holdings(symbol, current_weight * 0.5, tag="take-profit-25pct")
+                            → _tp_taken.add(symbol)
+              [ ] 8.1.10 Call _handle_crypto(slice) at end of method
+  [ ] 8.2   Verify trailing stop fires in backtest during a 10%+ drawdown period
+  [ ] 8.3   Verify hard stop fires in backtest during a 7%+ single-stock drop
+  [ ] 8.4   Verify take-profit cuts position size (not liquidates entirely) on +25%
+
+  PHASE 8 GATE: All three per-position stops fire correctly in backtest.
+
+
+================================================================================
+PHASE 9 — CRYPTO SATELLITE
+================================================================================
+
+  [ ] 9.1   Implement _handle_crypto(slice)
+              [ ] 9.1.1  Guard: if _trading_halted → return
+              [ ] 9.1.2  Guard: if not is_market_open(self._btc) → return
+              [ ] 9.1.3  Read margin_rate from slice.margin_interest_rates.get(self._btc)
+              [ ] 9.1.4  Guard: if margin_rate is None → return
+              [ ] 9.1.5  Extract rate = margin_rate.interest_rate
+              [ ] 9.1.6  Update _funding_min indicator: _funding_min.update(time, rate)
+              [ ] 9.1.7  If rate > FUNDING_HI and not is_short → _place_crypto_order(−CRYPTO_SLEEVE)
+              [ ] 9.1.8  If rate < FUNDING_LO and not is_long → _place_crypto_order(+CRYPTO_SLEEVE)
+              [ ] 9.1.9  If neutral zone and invested → liquidate(_btc, tag="crypto-funding-neutral")
+  [ ] 9.2   Implement _place_crypto_order(target_weight)
+              [ ] 9.2.1  Guard: price > 0 before dividing
+              [ ] 9.2.2  Compute target_value = portfolio_value × abs(target_weight)
+              [ ] 9.2.3  Compute quantity = target_value / price
+              [ ] 9.2.4  Round DOWN to lot size: (qty // lot_size) × lot_size
+              [ ] 9.2.5  Guard: if rounded qty < lot_size → return (too small)
+              [ ] 9.2.6  Liquidate opposite side if invested (prevent stranded positions)
+              [ ] 9.2.7  Place market_order with signed qty and tag
+  [ ] 9.3   Verify crypto orders respect lot size (no fractional lots)
+  [ ] 9.4   Verify crypto sleeve stays within CRYPTO_SLEEVE weight
+  [ ] 9.5   Verify crypto is liquidated when funding rate is neutral
+
+  PHASE 9 GATE: Crypto satellite trades correctly on funding rate signal; lot size respected.
+
+
+================================================================================
+PHASE 10 — POST-TRADE RISK ENFORCEMENT (CIRCUIT BREAKER)
+================================================================================
+
+  [ ] 10.1  Implement _trigger_halt(drawdown)
+              [ ] 10.1.1 Call self.liquidate(tag="drawdown-halt-12pct")
+              [ ] 10.1.2 Set _trading_halted = True
+              [ ] 10.1.3 Set _defensive_mode = False
+              [ ] 10.1.4 Log halt message with drawdown %
+              [ ] 10.1.5 Send notify.email() with halt alert
+  [ ] 10.2  Implement _attempt_recovery(drawdown, total)
+              [ ] 10.2.1 Fetch VIX via _safe_history(_vix, 1, Resolution.DAILY)
+              [ ] 10.2.2 Read last VIX close; default to 30.0 if unavailable
+              [ ] 10.2.3 If vix_level < VIX_RECOVERY:
+                           → _trading_halted = False
+                           → _peak_value = total (reset peak)
+                           → log recovery message
+  [ ] 10.3  Implement _daily_risk_check() (scheduled handler)
+              [ ] 10.3.1 Guard: if is_warming_up → return
+              [ ] 10.3.2 Compute drawdown from _peak_value
+              [ ] 10.3.3 If drawdown >= HALT_DD and not _trading_halted → _trigger_halt()
+              [ ] 10.3.4 If drawdown >= DEFENSIVE_DD and not defensive and not halted → set defensive
+              [ ] 10.3.5 If _trading_halted and drawdown < RECOVERY_DD → _attempt_recovery()
+              [ ] 10.3.6 If _defensive_mode and drawdown < RECOVERY_DD → clear defensive; log
+              [ ] 10.3.7 Compute margin_pct = margin_remaining / total_portfolio_value
+              [ ] 10.3.8 If margin_pct < MARGIN_EMERGENCY and crypto invested → liquidate crypto
+  [ ] 10.4  Implement _restore_state_after_restart()
+              [ ] 10.4.1 Loop portfolio holdings
+              [ ] 10.4.2 For each invested symbol not in _entry_price: populate _entry_price and _peak_price
+              [ ] 10.4.3 Call this at end of first on_data after warm-up
+  [ ] 10.5  Verify halt fires in backtest: simulate 2020 COVID crash period
+  [ ] 10.6  Verify recovery requires both drawdown < 5% AND VIX < 25
+  [ ] 10.7  Verify defensive mode halves position weights at next rebalance
+
+  PHASE 10 GATE: Circuit breaker halts, defensive mode reduces exposure; recovery is gated.
+
+
+================================================================================
+PHASE 11 — MONITORING & OBSERVABILITY
+================================================================================
+
+  [ ] 11.1  Implement _log_state() (scheduled handler — before market close)
+              [ ] 11.1.1 Guard: if is_warming_up → return
+              [ ] 11.1.2 Compute total, cash_pct, drawdown, n_positions, margin_pct
+              [ ] 11.1.3 self.plot("Risk", "DrawdownPct", drawdown × 100)
+              [ ] 11.1.4 self.plot("Risk", "CashPct", cash_pct × 100)
+              [ ] 11.1.5 self.plot("Risk", "MarginPct", margin_pct × 100)
+              [ ] 11.1.6 self.plot("Alpha", "Positions", n_positions)
+              [ ] 11.1.7 self.plot("Portfolio", "TotalValue", total)
+  [ ] 11.2  Add rebalance summary log in _monthly_rebalance():
+              [ ] 11.2.1 Log portfolio value, cash %, number of positions
+              [ ] 11.2.2 Log top-5 symbols by weight
+              [ ] 11.2.3 Log current drawdown and mode (normal/defensive/halted)
+  [ ] 11.3  Add universe change log in on_securities_changed():
+              [ ] 11.3.1 Log count of added and removed securities
+  [ ] 11.4  Add crypto signal log in _handle_crypto():
+              [ ] 11.4.1 Log funding rate, direction decision, quantity placed
+  [ ] 11.5  Verify all custom charts appear in QuantConnect backtest results panel
+  [ ] 11.6  Verify log messages appear in chronological order with no missing events
+
+  PHASE 11 GATE: Charts and logs populated; all major events visible in backtest output.
+
+
+================================================================================
+PHASE 12 — SUPPLY & DEMAND INTEGRATION (OPTIONAL SIGNAL)
+================================================================================
+
+  [ ] 12.1  Implement _identify_demand_zones(symbol, lookback=120)
+              [ ] 12.1.1 Fetch history via _safe_history()
+              [ ] 12.1.2 Compute avg_body for reference
+              [ ] 12.1.3 Detect base candles (body < avg_body × 0.5)
+              [ ] 12.1.4 Detect bullish impulse after base (impulse_pct > 1.5%, body > avg × 1.5)
+              [ ] 12.1.5 Check impulse size > zone height × 3
+              [ ] 12.1.6 Check zone is FRESH (price never re-entered since formation)
+              [ ] 12.1.7 Return list of zone dicts sorted by impulse strength
+  [ ] 12.2  Implement _identify_supply_zones(symbol, lookback=120)
+              [ ] 12.2.1 Mirror of demand zone logic — bearish impulse
+  [ ] 12.3  Implement _check_sd_entry(symbol)
+              [ ] 12.3.1 Get current price
+              [ ] 12.3.2 Find if price is inside a demand zone (within 0.5% buffer)
+              [ ] 12.3.3 Confirm bounce: last close > zone top
+              [ ] 12.3.4 Compute stop, target (2.5:1 R:R), return signal dict
+  [ ] 12.4  Implement _sd_position_size(symbol, entry, stop, risk_pct=0.01)
+              [ ] 12.4.1 risk_dollars = portfolio_value × risk_pct
+              [ ] 12.4.2 shares = risk_dollars / abs(entry − stop)
+              [ ] 12.4.3 Cap at 10% portfolio weight
+              [ ] 12.4.4 Guard: if risk_per_share = 0 → return 0
+  [ ] 12.5  Implement _scan_sd_signals() (scheduled daily)
+              [ ] 12.5.1 Guard: warming_up or halted → return
+              [ ] 12.5.2 Loop active equities not already invested
+              [ ] 12.5.3 Call _check_sd_entry() per symbol
+              [ ] 12.5.4 Place limit order + stop order on signal
+              [ ] 12.5.5 Store target in _sd_targets, stop order id in _sd_stops
+  [ ] 12.6  Add S&D take-profit check in on_data()
+              [ ] 12.6.1 Loop _sd_targets: if price >= target → liquidate + cancel stop
+  [ ] 12.7  Initialize _sd_targets = {} and _sd_stops = {} in initialize()
+  [ ] 12.8  Schedule _scan_sd_signals: every_day + 60min
+  [ ] 12.9  Verify S&D entries are placed when price enters a demand zone
+  [ ] 12.10 Verify S&D stops are cancelled when take-profit is hit
+
+  PHASE 12 GATE: S&D scanner fires daily; orders placed on zone touch with confirmation.
+
+
+================================================================================
+PHASE 13 — WYCKOFF INTEGRATION (OPTIONAL SIGNAL)
+================================================================================
+
+  [ ] 13.1  Implement _detect_selling_climax(bars, lookback=60)
+  [ ] 13.2  Implement _detect_buying_climax(bars, lookback=60)
+  [ ] 13.3  Implement _detect_spring(bars, support_level, tolerance=0.005)
+  [ ] 13.4  Implement _detect_sos(bars, resistance_level, lookback=60)
+  [ ] 13.5  Implement _detect_upthrust(bars, resistance_level, tolerance=0.005)
+  [ ] 13.6  Implement _classify_wyckoff_phase(symbol, lookback=150)
+              [ ] 13.6.1 Identify trading range (recent high/low)
+              [ ] 13.6.2 Run all 5 event detectors
+              [ ] 13.6.3 Return phase label string
+  [ ] 13.7  Implement _vsa_confirmation(bars, direction)
+              [ ] 13.7.1 Detect No Supply (narrow bar, low vol, down bar) for LONG
+              [ ] 13.7.2 Detect No Demand (narrow bar, low vol, up bar) for SHORT
+  [ ] 13.8  Implement _wyckoff_signal(symbol)
+              [ ] 13.8.1 Get phase via _classify_wyckoff_phase()
+              [ ] 13.8.2 Map phase → direction, stop, target
+              [ ] 13.8.3 Return signal dict or None
+  [ ] 13.9  Implement _sd_wyckoff_combined_signal(symbol)
+              [ ] 13.9.1 Check S&D zone proximity
+              [ ] 13.9.2 Check Wyckoff phase is accumulation-type
+              [ ] 13.9.3 Check VSA confirmation (No Supply)
+              [ ] 13.9.4 Return HIGH confidence signal only if all three align
+  [ ] 13.10 Implement _scan_wyckoff_signals() (scheduled weekly)
+              [ ] 13.10.1 Guard: warming_up or halted → return
+              [ ] 13.10.2 Loop active equities not invested
+              [ ] 13.10.3 Call _wyckoff_signal() or _sd_wyckoff_combined_signal()
+              [ ] 13.10.4 Size position at 1% risk per trade
+              [ ] 13.10.5 Place market order with phase tag
+  [ ] 13.11 Initialize _wyckoff_stops = {} and _wyckoff_targets = {} in initialize()
+  [ ] 13.12 Schedule _scan_wyckoff_signals: week_start + 30min
+  [ ] 13.13 Add Wyckoff take-profit check in on_data()
+  [ ] 13.14 Verify Wyckoff scanner fires weekly and logs phase classifications
+
+  PHASE 13 GATE: Wyckoff classifier returns phase labels; trades placed on Spring/SOS phases.
+
+
+================================================================================
+PHASE 14 — IN-SAMPLE BACKTESTING (2015–2020)
+================================================================================
+
+  [ ] 14.1  Run full backtest: set_start_date(2015,1,1), set_end_date(2020,12,31)
+  [ ] 14.2  Check: Sharpe Ratio >= 1.2
+  [ ] 14.3  Check: Sortino Ratio >= 1.5
+  [ ] 14.4  Check: CAGR >= 15%
+  [ ] 14.5  Check: Maximum Drawdown <= 15%
+  [ ] 14.6  Check: Win Rate >= 52% (monthly periods)
+  [ ] 14.7  Check: Profit Factor >= 1.5
+  [ ] 14.8  Check: Calmar Ratio >= 1.0
+  [ ] 14.9  Check: Alpha vs SPY > 5% annually
+  [ ] 14.10 Check: Beta vs SPY < 0.7
+  [ ] 14.11 Check: Average Monthly Turnover < 35%
+  [ ] 14.12 Check: No position exceeded POSITION_CAP in any month
+  [ ] 14.13 Check: No sector exceeded SECTOR_CAP in any month
+  [ ] 14.14 Check: Halt fired during COVID crash (Feb–Apr 2020)
+  [ ] 14.15 Check: Recovery required VIX < 25 after COVID crash
+  [ ] 14.16 Check: Zero trades placed during warm-up period
+  [ ] 14.17 Review log for any INVALID ORDER or error messages
+  [ ] 14.18 Review charts: DrawdownPct, CashPct, Positions, TotalValue all populated
+  [ ] 14.19 Document in-sample results in a results notes file
+
+  PHASE 14 GATE: ALL acceptance criteria pass on in-sample backtest.
+
+
+================================================================================
+PHASE 15 — PARAMETER SENSITIVITY ANALYSIS
+================================================================================
+
+  [ ] 15.1  Create sensitivity test matrix (vary one parameter at a time)
+  [ ] 15.2  Test MOMENTUM_LOOKBACK: 126, 189, 252, 315, 504 days
+  [ ] 15.3  Test MOMENTUM_SKIP: 0, 11, 22, 33 days
+  [ ] 15.4  Test TOP_N: 10, 15, 20, 25, 35, 50 stocks
+  [ ] 15.5  Test VOL_LOOKBACK: 20, 40, 60, 90, 120 days
+  [ ] 15.6  Test HARD_STOP: 5%, 6%, 7%, 8%, 10%, 12%
+  [ ] 15.7  Test TRAILING_STOP: 7%, 8%, 10%, 12%, 15%
+  [ ] 15.8  Test TAKE_PROFIT: 15%, 20%, 25%, 30%, 40%
+  [ ] 15.9  Test DEFENSIVE_DD: 5%, 6%, 8%, 10%, 12%
+  [ ] 15.10 Test HALT_DD: 10%, 12%, 15%, 18%, 20%
+  [ ] 15.11 Test SECTOR_CAP: 20%, 25%, 30%, 40%
+  [ ] 15.12 Test POSITION_CAP: 10%, 12%, 15%, 20%, 25%
+  [ ] 15.13 Test FUNDING_HI/FUNDING_LO thresholds (crypto)
+  [ ] 15.14 Record Sharpe and Max DD for every test combination
+  [ ] 15.15 Confirm strategy remains profitable across ±20% of each base parameter
+  [ ] 15.16 Identify any parameters with cliff-edge sensitivity → reconsider those
+
+  PHASE 15 GATE: Strategy robust to ±20% variation in all key parameters.
+
+
+================================================================================
+PHASE 16 — OUT-OF-SAMPLE BACKTESTING (2021–2024)
+================================================================================
+
+  [ ] 16.1  Freeze all parameters at base values from in-sample period
+  [ ] 16.2  Run backtest: set_start_date(2021,1,1), set_end_date(2024,12,31)
+  [ ] 16.3  Check same 11 acceptance criteria from Phase 14
+  [ ] 16.4  Check: 2022 bear market drawdown stayed within circuit breaker limits
+  [ ] 16.5  Check: 2022 recovery triggered only when VIX < 25
+  [ ] 16.6  Compare out-of-sample Sharpe vs in-sample Sharpe (expect < 10% degradation)
+  [ ] 16.7  Compare out-of-sample CAGR vs in-sample CAGR
+  [ ] 16.8  Check: No look-ahead bias indicators (all uses guarded with is_warming_up)
+  [ ] 16.9  Document out-of-sample results
+
+  PHASE 16 GATE: Strategy holds up on unseen data; no significant performance cliff.
+
+
+================================================================================
+PHASE 17 — WALK-FORWARD VALIDATION
+================================================================================
+
+  [ ] 17.1  Divide full period (2015–2024) into 6-month windows
+  [ ] 17.2  Run 18 overlapping backtests (each window: 4yr train, 6mo test)
+  [ ] 17.3  Record Sharpe, Max DD, CAGR for each 6-month test window
+  [ ] 17.4  Check: No more than 2 consecutive losing 6-month windows
+  [ ] 17.5  Check: Median 6-month Sharpe > 0.8
+  [ ] 17.6  Check: Max single-window drawdown < 18%
+  [ ] 17.7  Plot rolling Sharpe over time — confirm no structural break
+  [ ] 17.8  Document walk-forward summary
+
+  PHASE 17 GATE: Walk-forward confirms consistent edge across time; no single bad era dominates.
+
+
+================================================================================
+PHASE 18 — STRESS TESTING
+================================================================================
+
+  [ ] 18.1  COVID Crash Test: backtest Feb 2020 – Jun 2020 only
+              [ ] 18.1.1 Halt must fire before drawdown exceeds HALT_DD + 2%
+              [ ] 18.1.2 Recovery must not resume until VIX drops below 25
+              [ ] 18.1.3 No new positions taken during halted period
+  [ ] 18.2  2022 Bear Market Test: backtest Jan 2022 – Oct 2022 only
+              [ ] 18.2.1 Defensive mode must engage before drawdown reaches HALT_DD
+              [ ] 18.2.2 Crypto sleeve must be liquidated if margin_pct < 5%
+  [ ] 18.3  2018 Q4 Selloff Test: backtest Sep 2018 – Jan 2019 only
+              [ ] 18.3.1 Trailing stops fire during rapid decline
+              [ ] 18.3.2 Rebalance correctly reduces exposure after stop-outs
+  [ ] 18.4  Flash Crash Simulation: run with no-slippage model removed, 1% slippage
+              [ ] 18.4.1 Confirm strategy survives 1% slippage scenario
+  [ ] 18.5  Crypto Funding Spike: confirm position sized correctly at 10% cap
+
+  PHASE 18 GATE: Strategy survives all three major crash periods within risk limits.
+
+
+================================================================================
+PHASE 19 — CODE REVIEW & CLEAN-UP
+================================================================================
+
+  [ ] 19.1  Review all methods for bare except clauses → add specific exception types
+  [ ] 19.2  Confirm every scheduled function has is_warming_up guard
+  [ ] 19.3  Confirm every dict iteration uses list() copy
+  [ ] 19.4  Confirm every division is guarded against zero denominator
+  [ ] 19.5  Confirm every history call goes through _safe_history()
+  [ ] 19.6  Confirm every indicator read checks .is_ready
+  [ ] 19.7  Confirm every order has a tag string
+  [ ] 19.8  Confirm no magic numbers exist in method bodies (all are class constants)
+  [ ] 19.9  Confirm Alpha layer methods do not call self.liquidate() or self.market_order()
+  [ ] 19.10 Confirm PCM layer does not read self.portfolio directly
+  [ ] 19.11 Confirm _trading_halted is only set in _trigger_halt() and _attempt_recovery()
+  [ ] 19.12 Remove all debug print statements (replace with self.log if needed)
+  [ ] 19.13 Trim comments: only keep those explaining non-obvious WHY (not WHAT)
+  [ ] 19.14 Final backtest: 2015–2024 full period — confirm no regressions
+  [ ] 19.15 Save final clean algorithm file as ammro_algorithm_v1.py
+
+  PHASE 19 GATE: Code passes all architecture rules; full-period backtest still passes.
+
+
+================================================================================
+PHASE 20 — PRE-DEPLOYMENT CHECKLIST
+================================================================================
+
+  [ ] 20.1  Confirm Interactive Brokers brokerage model matches actual IB account type
+  [ ] 20.2  Confirm Binance Futures margin account is set up for crypto sleeve
+  [ ] 20.3  Confirm email notification address is correct in all notify.email() calls
+  [ ] 20.4  Confirm free_portfolio_value_percentage = 0.05 (5% cash buffer)
+  [ ] 20.5  Confirm warm-up set to 280 days (covers all lookbacks)
+  [ ] 20.6  Confirm all corporate action handling tested (splits, delistings)
+  [ ] 20.7  Confirm on_order_event handles FILLED, INVALID, CANCELED
+  [ ] 20.8  Review on_securities_changed for add/remove edge cases
+  [ ] 20.9  Confirm slippage and fee model matches broker schedule
+  [ ] 20.10 Confirm crypto lot size rounding is correct for Binance BTCUSDT
+  [ ] 20.11 Confirm is_market_open() guard on all crypto orders
+  [ ] 20.12 Run final sensitivity test: ±20% all base parameters pass acceptance criteria
+
+  PHASE 20 GATE: All 12 pre-deployment items checked. Ready for paper trading.
+
+
+================================================================================
+PHASE 21 — PAPER TRADING
+================================================================================
+
+  [ ] 21.1  Deploy to QuantConnect paper trading environment
+  [ ] 21.2  Set capital to match intended live allocation (or scaled equivalent)
+  [ ] 21.3  Monitor daily for minimum 8 weeks (2 full monthly rebalance cycles)
+  [ ] 21.4  Week 1: Verify universe selection firing correctly
+  [ ] 21.5  Week 1: Verify first monthly rebalance places expected orders
+  [ ] 21.6  Week 2: Verify on_order_event fills logged correctly in paper mode
+  [ ] 21.7  Week 2: Verify charts updating daily
+  [ ] 21.8  Week 3: Verify crypto funding signal fires and positions correct
+  [ ] 21.9  Week 4: Verify trailing stops fire on any positions down 10%+
+  [ ] 21.10 Week 5–8: Compare live performance to backtest period (same dates)
+  [ ] 21.11 Week 5–8: Confirm drawdown circuit breaker state updates correctly
+  [ ] 21.12 Week 8: Check total transaction costs vs backtest fee model
+  [ ] 21.13 Week 8: Check average slippage per trade vs 5–10bps assumption
+  [ ] 21.14 Week 8: Verify no unintended orders placed (check full order log)
+  [ ] 21.15 Week 8: Confirm email notifications received (if any risk alerts fired)
+  [ ] 21.16 Document paper trading results vs backtest expectations
+
+  PHASE 21 GATE: 8 weeks paper trading complete; performance broadly matches backtest;
+                 no unexpected behavior in any of the 15 checks above.
+
+
+================================================================================
+PHASE 22 — LIVE DEPLOYMENT
+================================================================================
+
+  [ ] 22.1  Connect QuantConnect to Interactive Brokers live account
+  [ ] 22.2  Connect QuantConnect to Binance Futures account (API keys)
+  [ ] 22.3  Deploy algorithm to live trading with 50% of intended capital
+  [ ] 22.4  Set calendar reminder: monthly performance review
+  [ ] 22.5  Set calendar reminder: quarterly strategy review (re-run walk-forward)
+  [ ] 22.6  Monitor daily: drawdown, margin, open orders, position weights
+  [ ] 22.7  Maintain trade log: symbol, entry date, exit date, reason, P&L
+  [ ] 22.8  After 3 months: review performance vs benchmark and backtest
+  [ ] 22.9  After 3 months: scale to full intended capital if criteria met
+  [ ] 22.10 After 6 months: re-run full walk-forward validation on live data
+  [ ] 22.11 After 12 months: evaluate S&D and Wyckoff signal contribution
+              → Increase weight if contributing positively
+              → Remove if contributing negatively or adding noise
+
+  PHASE 22 GATE: Algorithm running live; monitoring in place; scale-up criteria defined.
+
+
+================================================================================
+ONGOING MAINTENANCE
+================================================================================
+
+  [ ] M.1   Monthly: Review drawdown, Sharpe, turnover — flag if metrics degrade
+  [ ] M.2   Monthly: Check universe quality (any filter criteria need adjustment?)
+  [ ] M.3   Quarterly: Re-run walk-forward validation on trailing 3 years of data
+  [ ] M.4   Quarterly: Review parameter sensitivity (market regimes shift)
+  [ ] M.5   Annually: Review alpha signal weights (momentum premium strength varies)
+  [ ] M.6   Annually: Review crypto satellite (regulatory and market structure changes)
+  [ ] M.7   On drawdown > 10% in live: trigger manual review before circuit breaker fires
+  [ ] M.8   On any INVALID ORDER in live: investigate within 24 hours
+  [ ] M.9   On VIX spike > 35: manually review circuit breaker state
+  [ ] M.10  On regime change (bear market identified): consider manual parameter review
+
+
+================================================================================
+TASK SUMMARY
+================================================================================
+
+  Phase 0  — Environment Setup         :  11 tasks
+  Phase 1  — Initialize()              :  24 tasks
+  Phase 2  — Data Layer                :  28 tasks
+  Phase 3  — Universe Selection        :   9 tasks
+  Phase 4  — Alpha / Signal Gen        :  24 tasks
+  Phase 5  — Portfolio Construction    :  20 tasks
+  Phase 6  — Pre-Trade Risk Gate       :   7 tasks
+  Phase 7  — Execution Layer           :  13 tasks
+  Phase 8  — on_data Stops             :  12 tasks
+  Phase 9  — Crypto Satellite          :  15 tasks
+  Phase 10 — Circuit Breaker           :  13 tasks
+  Phase 11 — Monitoring                :   8 tasks
+  Phase 12 — S&D Integration           :  17 tasks
+  Phase 13 — Wyckoff Integration       :  17 tasks
+  Phase 14 — In-Sample Backtest        :  19 tasks
+  Phase 15 — Sensitivity Analysis      :  16 tasks
+  Phase 16 — Out-of-Sample Backtest    :   9 tasks
+  Phase 17 — Walk-Forward Validation   :   8 tasks
+  Phase 18 — Stress Testing            :  13 tasks
+  Phase 19 — Code Review               :  15 tasks
+  Phase 20 — Pre-Deployment Checklist  :  12 tasks
+  Phase 21 — Paper Trading             :  16 tasks
+  Phase 22 — Live Deployment           :  11 tasks
+  Ongoing  — Maintenance               :  10 tasks
+  ─────────────────────────────────────────────────
+  TOTAL                                : 376 tasks
+
+================================================================================
+END OF TASK LIST
+================================================================================
+File    : jamlquant_task_list.txt
+Author  : JamlQuant
+Date    : 2026-05-03
+================================================================================

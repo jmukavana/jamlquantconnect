@@ -1,0 +1,1105 @@
+================================================================================
+JAMLQUANT — ALGORITHM ARCHITECTURE DESIGN
+================================================================================
+Document    : Algorithm Architecture
+Platform    : QuantConnect / LEAN Engine (Python 3.11)
+Author      : JamlQuant
+Date        : 2026-05-03
+Principles  : Reliability | Latency | Risk Control | Separation of Concerns
+================================================================================
+
+
+================================================================================
+SECTION 1 — DESIGN PHILOSOPHY & GUIDING PRINCIPLES
+================================================================================
+
+FOUR PILLARS:
+
+  1. RELIABILITY
+       The algorithm must produce consistent, repeatable behavior.
+       It should not crash on missing data, bad fills, or unexpected market events.
+       Every external boundary (data, orders, indicators) must be guarded.
+
+  2. LATENCY AWARENESS
+       This is a daily-resolution strategy — latency is measured in seconds, not
+       microseconds. However, expensive operations (history calls, loops over 500
+       symbols) must be batched and scheduled carefully so they do not block event
+       processing or create time-frontier violations.
+
+  3. RISK CONTROL
+       Risk is not an afterthought — it is the first citizen of the design.
+       No order reaches the market without passing through at least two independent
+       risk checks. Pre-trade checks live in the Alpha/PCM layer. Post-trade
+       enforcement lives in the Risk layer. Circuit breakers live at the portfolio
+       level in the scheduler.
+
+  4. SEPARATION OF CONCERNS
+       Each layer does exactly one job and does not reach into another layer's
+       responsibilities. Alpha does not place orders. Execution does not compute
+       weights. Risk does not select the universe. Violations of this rule make
+       the system hard to test, debug, and extend.
+
+
+================================================================================
+SECTION 2 — SYSTEM ARCHITECTURE DIAGRAM
+================================================================================
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                        EXTERNAL DATA SOURCES                            │
+  │   Equity Prices │ Fundamentals │ VIX Index │ Crypto Futures │ Alt Data  │
+  └──────────────────────────────┬──────────────────────────────────────────┘
+                                 │ Slice (time-ordered, frontier-safe)
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 0 — DATA MANAGEMENT                                              │
+  │  Subscriptions │ Consolidators │ Indicators │ Warm-up Gate              │
+  └──────────────────────────────┬──────────────────────────────────────────┘
+                                 │ Ready signals, indicator values
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 1 — UNIVERSE SELECTION                                           │
+  │  Fundamental filter │ Dollar volume sort │ Daily async refresh           │
+  └──────────────────────────────┬──────────────────────────────────────────┘
+                                 │ List[Symbol]
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 2 — ALPHA / SIGNAL GENERATION                                    │
+  │  Momentum Score │ Quality Score │ RSI Gate │ S&D Zone Detector          │
+  │  Wyckoff Phase Classifier │ Crypto Funding Rate Signal                  │
+  └──────────────────────────────┬──────────────────────────────────────────┘
+                                 │ Dict[Symbol, CompositeScore]
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 3 — PORTFOLIO CONSTRUCTION                                       │
+  │  Rank & Select │ Inverse-Vol Weighting │ Sector Caps │ Position Caps    │
+  └──────────────────────────────┬──────────────────────────────────────────┘
+                                 │ Dict[Symbol, TargetWeight]
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 4 — PRE-TRADE RISK GATE  ◄── BLOCKS orders if checks fail       │
+  │  Drawdown check │ Halt flag │ Margin check │ Concentration check        │
+  └──────────────────────────────┬──────────────────────────────────────────┘
+                                 │ Approved Dict[Symbol, TargetWeight]
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 5 — EXECUTION                                                    │
+  │  Order type selection │ Order sizing │ Order tagging │ Fill tracking    │
+  └──────────────────────────────┬──────────────────────────────────────────┘
+                                 │ OrderTickets
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 6 — POST-TRADE RISK ENFORCEMENT (continuous)                    │
+  │  Trailing stops │ Hard stops │ Take-profit │ Circuit breaker            │
+  │  Margin monitor │ Sector drift │ Portfolio drawdown                     │
+  └──────────────────────────────┬──────────────────────────────────────────┘
+                                 │ Liquidation orders / state updates
+                                 ▼
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │  LAYER 7 — MONITORING & OBSERVABILITY                                   │
+  │  self.plot() │ self.log() │ self.notify.email() │ Audit trail dict      │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+SECTION 3 — LAYER 0: DATA MANAGEMENT
+================================================================================
+
+RESPONSIBILITY:
+  Own all data subscriptions, indicators, and consolidators.
+  Expose clean, ready-checked values to upper layers.
+  Never let an unready indicator reach the Alpha layer.
+
+SUBSCRIPTIONS:
+  ┌──────────────────┬────────────────────────┬──────────────────────────┐
+  │ Instrument       │ Method                 │ Resolution               │
+  ├──────────────────┼────────────────────────┼──────────────────────────┤
+  │ Equity universe  │ add_universe()         │ DAILY (async)            │
+  │ SPY benchmark    │ add_equity()           │ DAILY                    │
+  │ VIX index        │ add_index()            │ DAILY                    │
+  │ BTCUSDT perp     │ add_crypto_future()    │ DAILY                    │
+  └──────────────────┴────────────────────────┴──────────────────────────┘
+
+INDICATOR LIFECYCLE (per-security):
+  ADD    → on_securities_changed(added)  → create RSI, ATR, register
+  USE    → alpha layer checks .is_ready before reading .current.value
+  REMOVE → on_securities_changed(removed) → deregister_indicator()
+
+WARM-UP GATE:
+  - set_warm_up(280, Resolution.DAILY) covers all lookbacks
+  - ALL scheduled functions and on_data begin with: if self.is_warming_up: return
+  - Indicators are updated by LEAN automatically during warm-up
+
+LATENCY CONSIDERATION — HISTORY CALLS:
+  Problem : calling self.history(symbol, 280) inside a loop of 500 symbols
+            is O(N) sequential round-trips — expensive during rebalance
+  Solution: batch history calls where possible; cache last-computed scores
+            in self._score_cache; only recompute on rebalance day
+  Pattern:
+    self._score_cache     = {}   # symbol → composite_score (computed monthly)
+    self._score_cache_date = None
+    # Only recompute if cache is stale (new month)
+    if self._score_cache_date != self.time.month:
+        self._score_cache = self._compute_scores()
+        self._score_cache_date = self.time.month
+
+DATA QUALITY GUARDS:
+  - Always check bars is not None and not bars.empty before indexing
+  - Always check indicator.is_ready before reading .current.value
+  - Always check self.securities[symbol].price > 0 before dividing
+  - Wrap fundamentals access in try/except (missing fields return None in LEAN)
+
+CODE PATTERN — SAFE INDICATOR READ:
+```python
+def _safe_rsi(self, symbol):
+    ind = self._rsi.get(symbol)
+    if ind is None or not ind.is_ready:
+        return None
+    return ind.current.value
+
+def _safe_price(self, symbol):
+    sec = self.securities.get(symbol)
+    if sec is None:
+        return None
+    p = sec.price
+    return p if p > 0 else None
+```
+
+CODE PATTERN — SAFE HISTORY READ:
+```python
+def _safe_history(self, symbol, periods, resolution):
+    try:
+        bars = self.history(symbol, periods, resolution)
+        if bars is None or bars.empty or len(bars) < periods * 0.8:
+            return None
+        return bars
+    except Exception as e:
+        self.log(f"History error {symbol}: {e}")
+        return None
+```
+
+
+================================================================================
+SECTION 4 — LAYER 1: UNIVERSE SELECTION
+================================================================================
+
+RESPONSIBILITY:
+  Determine the investable universe daily.
+  Apply liquidity, size, and fundamental filters.
+  Return a clean list of Symbol objects — nothing else.
+
+DESIGN RULES:
+  - Universe filter is a PURE FUNCTION: input = List[Fundamental], output = List[Symbol]
+  - No state mutation inside _fundamental_filter()
+  - No order placement, no indicator creation, no logging in this layer
+  - Filter is asynchronous (universe_settings.asynchronous = True) to avoid
+    blocking the main data pipeline on filter evaluation
+
+FILTER PIPELINE (ordered by cost, cheapest first):
+  Step 1 — has_fundamental_data         (eliminates non-equity symbols quickly)
+  Step 2 — price > 10                   (eliminates penny stocks, O(1) check)
+  Step 3 — dollar_volume > 10_000_000   (eliminates illiquid names)
+  Step 4 — market_cap > 1_000_000_000   (mid/large cap only)
+  Step 5 — sector != FINANCIAL_SERVICES (structural filter)
+  Step 6 — sort by dollar_volume, take top 500
+
+LATENCY NOTE:
+  Universe filter runs on a separate thread when asynchronous=True.
+  The result is applied to the next data slice — expect up to 1-day lag.
+  This is acceptable for a monthly-rebalance strategy.
+
+ON SECURITIES CHANGED:
+  - Creates per-security indicators (RSI, ATR) for newly added securities
+  - Deregisters indicators and clears state for removed securities
+  - Liquidates positions in removed securities if invested
+  - This is the ONLY place indicator creation/deletion should happen
+
+CODE:
+```python
+def _fundamental_filter(self, fundamental):
+    filtered = [
+        f for f in fundamental
+        if f.has_fundamental_data
+        and f.price > 10
+        and f.dollar_volume > 10_000_000
+        and f.market_cap > 1_000_000_000
+        and f.asset_classification.morningstar_sector_code
+            != MorningstarSectorCode.FINANCIAL_SERVICES
+    ]
+    return [
+        f.symbol for f in sorted(
+            filtered, key=lambda x: x.dollar_volume, reverse=True)[:500]
+    ]
+
+def on_securities_changed(self, changes):
+    for sec in changes.added_securities:
+        s = sec.symbol
+        if s.security_type == SecurityType.EQUITY and s != self._spy:
+            self._rsi[s] = self.rsi(s, 14, Resolution.DAILY)
+            self._atr[s] = self.atr(s, 14, Resolution.DAILY)
+
+    for sec in changes.removed_securities:
+        s = sec.symbol
+        for store in (self._rsi, self._atr):
+            if s in store:
+                self.deregister_indicator(store.pop(s))
+        if self.portfolio[s].invested:
+            self.liquidate(s, tag="exit-universe-removal")
+        self._clear_position_state(s)
+```
+
+
+================================================================================
+SECTION 5 — LAYER 2: ALPHA / SIGNAL GENERATION
+================================================================================
+
+RESPONSIBILITY:
+  Compute a composite score for each symbol in the universe.
+  Return scores as a plain dict — no orders, no weight calculations here.
+  Each sub-signal is independently composable.
+
+SIGNAL MODULES (each is a private method returning a raw score dict):
+
+  ┌───────────────────────┬─────────┬───────────────────────────────────────┐
+  │ Signal                │ Weight  │ Method                                │
+  ├───────────────────────┼─────────┼───────────────────────────────────────┤
+  │ Price Momentum        │ 60%     │ _momentum_scores()                    │
+  │ Quality (ROE/D-E)     │ 30%     │ _quality_scores()                     │
+  │ RSI Timing Gate       │ 10%     │ _rsi_scores()                         │
+  │ S&D Zone Proximity    │ bonus   │ _sd_proximity_scores()  (optional)    │
+  │ Wyckoff Phase         │ filter  │ _wyckoff_phase_filter()  (optional)   │
+  │ Crypto Funding Rate   │ n/a     │ _crypto_signal()  (satellite only)    │
+  └───────────────────────┴─────────┴───────────────────────────────────────┘
+
+SEPARATION RULE — ALPHA LAYER MUST NOT:
+  X  Place or cancel orders
+  X  Modify self._peak_value or risk state
+  X  Call self.set_holdings() or self.liquidate()
+  X  Read from self.portfolio (weights come from portfolio construction)
+
+ALPHA LAYER MAY:
+  ✓  Read self.securities[s].price
+  ✓  Read self.history(s, N, Resolution.DAILY)
+  ✓  Read indicator values from self._rsi, self._atr
+  ✓  Read fundamentals via self.securities[s].fundamentals
+  ✓  Return a dict of scores to the caller
+
+NORMALIZATION PATTERN (always normalize before blending):
+```python
+def _normalize(raw_dict):
+    if not raw_dict:
+        return {}
+    vals  = list(raw_dict.values())
+    lo, hi = min(vals), max(vals)
+    span  = hi - lo if hi != lo else 1.0
+    return {k: (v - lo) / span for k, v in raw_dict.items()}
+```
+
+COMPOSITE SCORE ASSEMBLY:
+```python
+def _compute_scores(self):
+    m = _normalize(self._momentum_scores())   # 60%
+    q = _normalize(self._quality_scores())    # 30%
+    r = self._rsi_scores()                    # 10% — already 0/0.5/1.0
+
+    symbols = set(m) & set(q) & set(r)       # intersection — all three required
+    return {
+        s: 0.60 * m[s] + 0.30 * q.get(s, 0.0) + 0.10 * r.get(s, 0.5)
+        for s in symbols
+    }
+```
+
+CACHING STRATEGY (avoid redundant history calls):
+  - Score cache is keyed by (year, month) — computed once per month
+  - On rebalance day, cache is rebuilt
+  - On daily risk check, cache is read-only (no recompute)
+  - Cache is invalidated whenever universe changes significantly (>10% turnover)
+
+CRYPTO SIGNAL (satellite, separate from equity pipeline):
+  - Reads margin_interest_rates from slice in on_data
+  - Returns a direction enum: LONG / SHORT / FLAT
+  - Size is fixed (10% of portfolio) — not ranked or weighted
+  - Entirely self-contained: no cross-dependency with equity Alpha
+
+
+================================================================================
+SECTION 6 — LAYER 3: PORTFOLIO CONSTRUCTION
+================================================================================
+
+RESPONSIBILITY:
+  Transform composite scores into target portfolio weights.
+  Apply diversification constraints.
+  Return a clean Dict[Symbol, float] of weights summing to <= equity_sleeve%.
+
+CONSTRUCTION PIPELINE:
+  Step 1 — Receive scores from Alpha layer
+  Step 2 — Rank and select top-N (default 25)
+  Step 3 — Compute 60-day realized volatility per selected symbol
+  Step 4 — Inverse-vol weights: weight_i = (1/vol_i) / sum(1/vol_j)
+  Step 5 — Scale to equity sleeve (85% of portfolio)
+  Step 6 — Apply per-position cap (15%)
+  Step 7 — Apply sector cap (30% per Morningstar sector)
+  Step 8 — Halve all weights if in defensive mode
+
+SEPARATION RULE — PCM MUST NOT:
+  X  Check drawdown state
+  X  Place orders
+  X  Read risk flags (_trading_halted, _defensive_mode) directly
+     → Instead, receive these as parameters passed in by the orchestrator
+
+DESIGN PATTERN — PASS RISK STATE AS PARAMETERS:
+```python
+# Orchestrator (monthly rebalance scheduler) calls:
+weights = self._build_weights(
+    scores          = self._compute_scores(),
+    defensive_mode  = self._defensive_mode,
+    top_n           = 25,
+    equity_sleeve   = 0.85,
+    position_cap    = 0.15,
+    sector_cap      = 0.30
+)
+```
+
+SECTOR CAP ENFORCEMENT:
+```python
+def _apply_sector_caps(self, weights, cap=0.30):
+    sector_totals = {}
+    for symbol, weight in weights.items():
+        sector = self._get_sector(symbol)
+        sector_totals[sector] = sector_totals.get(sector, 0) + weight
+
+    adjusted = dict(weights)
+    for sector, total in sector_totals.items():
+        if total > cap:
+            scale = cap / total
+            for symbol in adjusted:
+                if self._get_sector(symbol) == sector:
+                    adjusted[symbol] *= scale
+    return adjusted
+
+def _get_sector(self, symbol):
+    try:
+        return self.securities[symbol].fundamentals \
+                   .asset_classification.morningstar_sector_code
+    except Exception:
+        return -1   # unknown sector
+```
+
+REBALANCE TRIGGER LOGIC:
+  Primary   : Monthly (first trading day, 30 min after open)
+  Secondary : Drift-based (if any position drifts > 3% from target weight)
+
+```python
+def _needs_rebalance(self, target_weights):
+    for symbol, target in target_weights.items():
+        if not self.portfolio[symbol].invested:
+            continue
+        current = (self.portfolio[symbol].holdings_value
+                   / self.portfolio.total_portfolio_value)
+        if abs(current - target) > 0.03:
+            return True
+    return False
+```
+
+
+================================================================================
+SECTION 7 — LAYER 4: PRE-TRADE RISK GATE
+================================================================================
+
+RESPONSIBILITY:
+  Act as a gatekeeper between Portfolio Construction and Execution.
+  Block ALL orders if portfolio-level risk conditions are breached.
+  Modify weights (reduce, not expand) if conditions are marginal.
+  This layer does NOT liquidate — it only approves or rejects.
+
+PRE-TRADE CHECKS (in order of severity):
+  ┌────┬──────────────────────────────┬────────────────────────────────────┐
+  │ #  │ Check                        │ Action on Fail                     │
+  ├────┼──────────────────────────────┼────────────────────────────────────┤
+  │ 1  │ _trading_halted == True      │ BLOCK all orders, return {}        │
+  │ 2  │ is_warming_up == True        │ BLOCK all orders, return {}        │
+  │ 3  │ drawdown >= HALT_DD (12%)    │ BLOCK, trigger liquidation         │
+  │ 4  │ drawdown >= DEFENSIVE_DD(8%) │ REDUCE all weights by 50%          │
+  │ 5  │ margin_pct < 10%             │ BLOCK crypto orders only           │
+  │ 6  │ Any weight > position_cap    │ CAP to position_cap                │
+  │ 7  │ Sector total > sector_cap    │ TRIM lowest-score in sector        │
+  └────┴──────────────────────────────┴────────────────────────────────────┘
+
+CODE PATTERN — GATE FUNCTION:
+```python
+def _pre_trade_gate(self, weights):
+    # Check 1 & 2 — hard blocks
+    if self._trading_halted or self.is_warming_up:
+        self.log("PRE-TRADE GATE: BLOCKED — halted or warming up")
+        return {}
+
+    total = self.portfolio.total_portfolio_value
+    drawdown = (self._peak_value - total) / self._peak_value \
+               if self._peak_value > 0 else 0.0
+
+    # Check 3 — halt threshold
+    if drawdown >= self.HALT_DD:
+        self.log(f"PRE-TRADE GATE: BLOCKED — drawdown {drawdown:.1%} >= {self.HALT_DD:.0%}")
+        return {}
+
+    # Check 4 — defensive mode: halve all weights
+    if drawdown >= self.DEFENSIVE_DD:
+        weights = {s: w * 0.5 for s, w in weights.items()}
+        self.log(f"PRE-TRADE GATE: REDUCED weights 50% — defensive mode")
+
+    # Check 5 — concentration caps (already applied in PCM, double-check here)
+    weights = {s: min(w, self.POSITION_CAP) for s, w in weights.items()}
+
+    return weights
+```
+
+WHY TWO LAYERS OF RISK?
+  - PCM applies caps as part of construction (ideal scenario)
+  - Pre-trade gate catches any edge case where caps were bypassed
+  - Defense in depth: two independent checks prevent any single failure from
+    sending an oversized order to the market
+
+
+================================================================================
+SECTION 8 — LAYER 5: EXECUTION
+================================================================================
+
+RESPONSIBILITY:
+  Convert approved target weights into orders.
+  Select the correct order type for each situation.
+  Tag every order. Track fills via on_order_event.
+
+ORDER TYPE DECISION MATRIX:
+  ┌──────────────────────────────┬──────────────────┬──────────────────────┐
+  │ Situation                    │ Order Type       │ Reason               │
+  ├──────────────────────────────┼──────────────────┼──────────────────────┤
+  │ Monthly rebalance entries    │ Market-on-Open   │ Official open print  │
+  │ Monthly rebalance exits      │ Market-on-Open   │ Guaranteed fill      │
+  │ Stop loss (risk breach)      │ Stop Market      │ Speed > price        │
+  │ Trailing stop hit            │ Market           │ Immediate exit       │
+  │ Take profit (25%)            │ Limit (mid)      │ Capture premium      │
+  │ Crypto entry (funding signal)│ Market           │ 24/7 liquid market   │
+  │ Crypto stop loss             │ Stop Market      │ No slippage cap      │
+  │ Mid-month weight adjustment  │ Limit (1hr TIF)  │ Minimize cost        │
+  └──────────────────────────────┴──────────────────┴──────────────────────┘
+
+ORDER TAGGING CONVENTION (mandatory — never submit untagged):
+  Format    : "{action}-{signal}-{detail}"
+  Examples  :
+    "entry-rebalance-monthly"
+    "exit-rotation-monthly"
+    "stop-loss-7pct"
+    "trailing-stop-10pct"
+    "take-profit-25pct"
+    "crypto-funding-entry-long"
+    "crypto-funding-neutral-exit"
+    "margin-reduction-emergency"
+    "exit-universe-removal"
+    "drawdown-halt-12pct"
+
+EXECUTION CODE:
+```python
+def _execute_rebalance(self, weights):
+    approved = self._pre_trade_gate(weights)
+    if not approved:
+        return
+
+    targets = [PortfolioTarget(s, w) for s, w in approved.items()]
+    self.set_holdings(targets, liquidate_existing_holdings=True)
+    self.log(f"Rebalance executed: {len(targets)} positions, "
+             f"defensive={self._defensive_mode}")
+```
+
+FILL TRACKING (on_order_event):
+```python
+def on_order_event(self, order_event):
+    tag    = order_event.tag or ""
+    symbol = order_event.symbol
+
+    if order_event.status == OrderStatus.FILLED:
+        self.log(f"FILL [{tag}] {symbol} "
+                 f"qty={order_event.fill_quantity:+.4f} "
+                 f"@ {order_event.fill_price:.4f} "
+                 f"fee={order_event.order_fee}")
+
+        if "entry" in tag or "rebalance" in tag:
+            self._record_entry(symbol, order_event.fill_price)
+
+        if any(k in tag for k in ("stop", "exit", "halt", "neutral")):
+            self._clear_position_state(symbol)
+
+    elif order_event.status == OrderStatus.INVALID:
+        self.log(f"INVALID ORDER: {symbol} — {order_event.message}")
+
+    elif order_event.status == OrderStatus.CANCELED:
+        self.log(f"CANCELED: {symbol} [{tag}]")
+```
+
+SLIPPAGE & FEE CONFIGURATION:
+```python
+def initialize(self):
+    # Equity: Interactive Brokers fee model
+    self.set_brokerage_model(
+        BrokerageModel.INTERACTIVE_BROKERS_BROKERAGE, AccountType.MARGIN)
+
+    # Reserve 5% cash — never fully invested
+    self.settings.free_portfolio_value_percentage = 0.05
+```
+
+
+================================================================================
+SECTION 9 — LAYER 6: POST-TRADE RISK ENFORCEMENT
+================================================================================
+
+RESPONSIBILITY:
+  Continuously monitor open positions and portfolio health.
+  This is the only layer allowed to liquidate positions outside of rebalance.
+  Operates in two modes: event-driven (on_data) and scheduled (daily check).
+
+POST-TRADE RISK TRIGGERS:
+  ┌────────────────────────────┬────────────┬───────────────────────────────┐
+  │ Trigger                    │ Threshold  │ Action                        │
+  ├────────────────────────────┼────────────┼───────────────────────────────┤
+  │ Trailing stop              │ 10% below  │ Liquidate symbol              │
+  │                            │ peak price │                               │
+  │ Hard stop loss             │ 7% below   │ Liquidate symbol              │
+  │                            │ entry price│                               │
+  │ Take profit (partial)      │ +25% from  │ Reduce to 50% of position    │
+  │                            │ entry      │                               │
+  │ Portfolio drawdown (defend)│ 8%         │ Halve weights at next rebal. │
+  │ Portfolio drawdown (halt)  │ 12%        │ Liquidate ALL, halt trading   │
+  │ Margin too low             │ < 5% of PV │ Liquidate crypto sleeve       │
+  │ Universe removal           │ on_sec_chg │ Liquidate symbol              │
+  └────────────────────────────┴────────────┴───────────────────────────────┘
+
+EVENT-DRIVEN STOPS (on_data — runs every bar):
+```python
+def on_data(self, slice):
+    if self.is_warming_up:
+        return
+
+    pv = self.portfolio.total_portfolio_value
+    self._peak_value = max(self._peak_value, pv)
+
+    for symbol in list(self._peak_price.keys()):
+        if not self.portfolio[symbol].invested:
+            self._clear_position_state(symbol)
+            continue
+
+        price = self.securities[symbol].price
+        self._peak_price[symbol] = max(self._peak_price[symbol], price)
+        entry = self._entry_price.get(symbol, price)
+
+        if price < self._peak_price[symbol] * self.TRAILING_STOP:
+            self.liquidate(symbol, tag="trailing-stop-10pct")
+            self._clear_position_state(symbol)
+
+        elif price < entry * self.HARD_STOP:
+            self.liquidate(symbol, tag="stop-loss-7pct")
+            self._clear_position_state(symbol)
+
+        elif (self.portfolio[symbol].unrealized_profit_percent > self.TAKE_PROFIT
+              and symbol not in self._tp_taken):
+            current_w = self.portfolio[symbol].holdings_value / pv
+            self.set_holdings(symbol, current_w * 0.5, tag="take-profit-25pct")
+            self._tp_taken.add(symbol)
+
+    self._handle_crypto(slice)
+```
+
+SCHEDULED CIRCUIT BREAKER (daily — 15 min after open):
+```python
+def _daily_risk_check(self):
+    if self.is_warming_up:
+        return
+
+    total    = self.portfolio.total_portfolio_value
+    drawdown = (self._peak_value - total) / self._peak_value \
+               if self._peak_value > 0 else 0.0
+
+    if drawdown >= self.HALT_DD and not self._trading_halted:
+        self._trigger_halt(drawdown)
+
+    elif drawdown >= self.DEFENSIVE_DD and not self._defensive_mode \
+                                      and not self._trading_halted:
+        self._defensive_mode = True
+        self.log(f"DEFENSIVE MODE ON — drawdown={drawdown:.1%}")
+
+    elif self._trading_halted and drawdown < self.RECOVERY_DD:
+        self._attempt_recovery(drawdown, total)
+
+    elif self._defensive_mode and drawdown < self.RECOVERY_DD:
+        self._defensive_mode = False
+        self.log(f"DEFENSIVE MODE OFF — drawdown={drawdown:.1%}")
+
+    # Margin guard
+    margin_pct = self.portfolio.margin_remaining / total if total > 0 else 1.0
+    if margin_pct < 0.05 and self.portfolio[self._btc].invested:
+        self.liquidate(self._btc, tag="margin-reduction-emergency")
+
+def _trigger_halt(self, drawdown):
+    self.liquidate(tag="drawdown-halt-12pct")
+    self._trading_halted = True
+    self._defensive_mode = False
+    self.log(f"!!! TRADING HALTED — drawdown={drawdown:.1%} !!!")
+    self.notify.email(
+        "jamlechmukavana9@gmail.com",
+        "AMMRO ALERT: Trading Halted",
+        f"Drawdown {drawdown:.1%} breached {self.HALT_DD:.0%} at {self.time}. "
+        f"All positions liquidated. Manual review required.")
+
+def _attempt_recovery(self, drawdown, total):
+    bars = self._safe_history(self._vix, 1, Resolution.DAILY)
+    vix  = float(bars['close'].iloc[-1]) if bars is not None and not bars.empty else 30.0
+    if vix < self.VIX_RECOVERY:
+        self._trading_halted = False
+        self._peak_value = total   # reset peak after recovery
+        self.log(f"Trading RESUMED — drawdown={drawdown:.1%}, VIX={vix:.1f}")
+```
+
+
+================================================================================
+SECTION 10 — LAYER 7: MONITORING & OBSERVABILITY
+================================================================================
+
+RESPONSIBILITY:
+  Provide full auditability of the algorithm's decisions and state.
+  Emit structured logs, custom charts, and live alerts.
+  This layer reads state — it does not modify it.
+
+WHAT TO LOG (and when):
+  ┌───────────────────────────┬────────────────────────────────────────────┐
+  │ Event                     │ Log Content                                │
+  ├───────────────────────────┼────────────────────────────────────────────┤
+  │ Monthly rebalance         │ date, portfolio value, # positions, DD     │
+  │ Every order fill          │ symbol, tag, qty, fill price, fee          │
+  │ Risk mode change          │ drawdown %, mode transition, VIX level     │
+  │ Universe change           │ symbols added, symbols removed             │
+  │ Score computation         │ top-10 scores (debug mode only)            │
+  │ Crypto signal             │ funding rate, direction, qty placed        │
+  │ Indicator not ready       │ symbol name, indicator type                │
+  │ History call failure      │ symbol, requested bars, actual bars        │
+  └───────────────────────────┴────────────────────────────────────────────┘
+
+CUSTOM CHARTS:
+```python
+def _log_state(self):
+    if self.is_warming_up:
+        return
+    total    = self.portfolio.total_portfolio_value
+    cash_pct = self.portfolio.cash / total if total > 0 else 0.0
+    drawdown = (self._peak_value - total) / self._peak_value \
+               if self._peak_value > 0 else 0.0
+    n_pos    = sum(1 for h in self.portfolio.values() if h.invested)
+    margin_p = self.portfolio.margin_remaining / total if total > 0 else 1.0
+
+    self.plot("Risk",      "DrawdownPct",  drawdown * 100)
+    self.plot("Risk",      "CashPct",      cash_pct * 100)
+    self.plot("Risk",      "MarginPct",    margin_p * 100)
+    self.plot("Alpha",     "Positions",    n_pos)
+    self.plot("Alpha",     "PeakValue",    self._peak_value)
+    self.plot("Portfolio", "TotalValue",   total)
+```
+
+AUDIT TRAIL DICT (for debugging trade decisions):
+```python
+self._audit = []   # list of dicts, appended on every decision
+
+def _audit_event(self, event_type, details):
+    self._audit.append({
+        'time':  str(self.time),
+        'type':  event_type,
+        **details
+    })
+    # Keep last 500 events (memory bound)
+    if len(self._audit) > 500:
+        self._audit = self._audit[-500:]
+```
+
+NOTIFICATION POLICY:
+  - Email only on HIGH SEVERITY events (halt, margin emergency)
+  - Never email on every fill (spam risk, cost)
+  - In paper trading: log everything; in live: log summary only
+
+
+================================================================================
+SECTION 11 — STATE MANAGEMENT: WHAT LIVES WHERE
+================================================================================
+
+PRINCIPLE: State lives at the lowest layer that needs it.
+           No layer reaches into another layer's private state.
+
+  ┌──────────────────────────┬──────────────────────────────────────────────┐
+  │ State Variable           │ Owner Layer / Purpose                        │
+  ├──────────────────────────┼──────────────────────────────────────────────┤
+  │ _rsi, _atr               │ Data — indicator references per symbol       │
+  │ _score_cache             │ Alpha — cached composite scores              │
+  │ _score_cache_date        │ Alpha — cache invalidation key (month)       │
+  │ _entry_price             │ Execution / Risk — fill price at entry       │
+  │ _peak_price              │ Risk — highest price since entry             │
+  │ _entry_time              │ Execution — datetime of entry fill           │
+  │ _tp_taken                │ Risk — set of symbols where TP was taken     │
+  │ _peak_value              │ Risk — highest portfolio value (for DD calc) │
+  │ _trading_halted          │ Risk — circuit breaker flag                  │
+  │ _defensive_mode          │ Risk — defensive mode flag                   │
+  │ _funding_min             │ Alpha (crypto) — 10-period min funding rate  │
+  │ _btc_lot_size            │ Data — crypto lot size constant              │
+  │ _audit                   │ Monitoring — event audit trail list          │
+  └──────────────────────────┴──────────────────────────────────────────────┘
+
+STATE MUTATION RULES:
+  _trading_halted    → only _trigger_halt() and _attempt_recovery() may set this
+  _defensive_mode    → only _daily_risk_check() may set this
+  _peak_value        → only on_data (update) and _attempt_recovery (reset) may write
+  _entry_price       → only _record_entry() writes; _clear_position_state() deletes
+  _peak_price        → only on_data writes (trailing stop update)
+  _score_cache       → only _compute_scores() writes; monthly rebalance triggers it
+
+POSITION STATE HELPERS (always use these — never mutate dicts directly):
+```python
+def _record_entry(self, symbol, fill_price):
+    self._entry_price[symbol] = fill_price
+    self._peak_price[symbol]  = fill_price
+    self._entry_time[symbol]  = self.time
+    self._tp_taken.discard(symbol)
+
+def _clear_position_state(self, symbol):
+    self._entry_price.pop(symbol, None)
+    self._peak_price.pop(symbol, None)
+    self._entry_time.pop(symbol, None)
+    self._tp_taken.discard(symbol)
+```
+
+
+================================================================================
+SECTION 12 — ERROR HANDLING & RELIABILITY PATTERNS
+================================================================================
+
+DEFENSIVE CODING RULES:
+  R1. All history calls wrapped in try/except — return None on failure
+  R2. All indicator reads guarded by .is_ready check
+  R3. All fundamentals access in try/except (fields can be None)
+  R4. Never divide by zero — guard all price/value denominators
+  R5. Never index into empty list/DataFrame — check length first
+  R6. Never mutate a dict while iterating — use list() copy
+  R7. is_warming_up guard at top of every scheduled function
+  R8. Use .get() with defaults on all dict lookups
+
+EXCEPTION HANDLING PATTERN:
+```python
+def _momentum_scores(self):
+    scores = {}
+    for symbol in list(self.active_securities.keys()):
+        try:
+            bars = self._safe_history(symbol, 280, Resolution.DAILY)
+            if bars is None:
+                continue
+            closes = bars['close'].values
+            if len(closes) < 252:
+                continue
+            scores[symbol] = closes[-22] / closes[0] - 1
+        except Exception as e:
+            self.log(f"Momentum score error {symbol}: {e}")
+            continue   # skip this symbol, do not crash
+    return scores
+```
+
+UNIVERSE SAFETY:
+  - on_securities_changed must never raise — wrap body in try/except
+  - If indicator creation fails, log and skip — do not halt the algorithm
+  - If liquidation on removal fails, log and continue
+
+ORDER SAFETY:
+  - After placing an order, check ticket.status != OrderStatus.INVALID
+  - Never place a market order without checking is_market_open() first
+  - Never place crypto orders without checking lot size compliance
+
+IDEMPOTENCY:
+  - Monthly rebalance is idempotent — calling it twice has no additional effect
+    because set_holdings targets a fixed weight (not a delta)
+  - Trailing stop liquidation is guarded by portfolio[symbol].invested check
+  - Halt flag prevents duplicate liquidation calls
+
+RECOVERY FROM UNEXPECTED STATE:
+  - On algorithm restart (live trading), LEAN restores portfolio state
+  - Re-populate _entry_price and _peak_price from portfolio holdings on first tick
+  - Pattern:
+```python
+def _restore_state_after_restart(self):
+    for symbol, holding in self.portfolio.items():
+        if holding.invested and symbol not in self._entry_price:
+            p = holding.average_price
+            self._entry_price[symbol] = p
+            self._peak_price[symbol]  = max(p, self.securities[symbol].price)
+            self._entry_time[symbol]  = self.time
+```
+
+
+================================================================================
+SECTION 13 — LATENCY BUDGET & PERFORMANCE CONSIDERATIONS
+================================================================================
+
+LEAN DAILY RESOLUTION LATENCY MODEL:
+  Data arrives once per bar (end of day for DAILY).
+  Scheduled functions execute at specified offsets from market open/close.
+  Latency budget for daily algo: order of minutes, not microseconds.
+
+EXPENSIVE OPERATIONS (optimize or batch):
+  ┌────────────────────────────────┬────────────┬────────────────────────────┐
+  │ Operation                      │ Cost       │ Mitigation                 │
+  ├────────────────────────────────┼────────────┼────────────────────────────┤
+  │ history(symbol, 280) × 500     │ Very High  │ Cache monthly; skip cache  │
+  │                                │            │ hit symbols                │
+  │ history(symbol, 63) × 25       │ High       │ Only on rebalance day      │
+  │ Wyckoff classifier × 500       │ Very High  │ Run weekly, not daily      │
+  │ S&D zone scan × 500            │ High       │ Run on rebalance day only  │
+  │ RSI.is_ready check × 500       │ Very Low   │ Inline, no concern         │
+  │ portfolio loop × 500           │ Low        │ Acceptable in on_data      │
+  └────────────────────────────────┴────────────┴────────────────────────────┘
+
+SCHEDULING STRATEGY (time-spread to avoid spikes):
+  08:45 (+15 min after open) — _daily_risk_check   (lightweight, just checks flags)
+  09:00 (+30 min after open) — _monthly_rebalance  (expensive, monthly only)
+  09:30 (+60 min after open) — _scan_sd_signals    (medium cost, daily scan)
+  10:00 (+90 min after open) — _scan_wyckoff       (expensive, weekly only)
+  15:55 (−5 min before close)— _log_state          (lightweight, just plots)
+
+  → Space expensive operations to avoid all running on the same tick
+
+LOOP SAFETY (never modify collection while iterating):
+```python
+# WRONG — may skip or error during iteration
+for symbol in self._peak_price:
+    if not self.portfolio[symbol].invested:
+        del self._peak_price[symbol]   # RuntimeError: dict changed size
+
+# CORRECT — iterate over a copy
+for symbol in list(self._peak_price.keys()):
+    if not self.portfolio[symbol].invested:
+        self._clear_position_state(symbol)
+```
+
+MEMORY MANAGEMENT:
+  - Limit _audit list to last 500 events
+  - Deregister indicators on universe removal (prevents memory leak)
+  - Do not store full history DataFrames in class state — compute and discard
+
+
+================================================================================
+SECTION 14 — EVENT FLOW: HOW DATA MOVES THROUGH THE SYSTEM
+================================================================================
+
+MONTHLY REBALANCE FLOW:
+  [Scheduler fires: month_start + 30min]
+        │
+        ▼
+  is_warming_up? → EXIT
+  _trading_halted? → LOG + EXIT
+        │
+        ▼
+  _compute_scores()
+    → _momentum_scores()   [history × active universe]
+    → _quality_scores()    [fundamentals × active universe]
+    → _rsi_scores()        [indicator reads × active universe]
+    → normalize + blend
+        │ Dict[Symbol, float]
+        ▼
+  _build_weights(scores, top_n=25, equity_sleeve=0.85)
+    → sort by score, select top-25
+    → inverse-vol weights from 60-day history
+    → apply position cap (15%)
+    → apply sector cap (30%)
+        │ Dict[Symbol, float]
+        ▼
+  _pre_trade_gate(weights)
+    → check halt flag → block if True
+    → check drawdown → halve if defensive
+    → check concentration caps
+        │ Approved Dict[Symbol, float]
+        ▼
+  _execute_rebalance(approved_weights)
+    → set_holdings(targets, liquidate_existing_holdings=True)
+    → _record_entry() for new positions via on_order_event
+        │
+        ▼
+  _log_state() [at market close]
+
+DAILY RISK FLOW:
+  [Scheduler fires: every_day + 15min]
+        │
+        ▼
+  _daily_risk_check()
+    → compute drawdown from _peak_value
+    → if >= 12%: _trigger_halt()
+    → elif >= 8%: set _defensive_mode = True
+    → elif recovering: _attempt_recovery()
+    → check margin_pct < 5%: liquidate crypto
+        │
+        ▼
+  [No orders placed unless halt or margin breach]
+
+REAL-TIME STOP FLOW:
+  [on_data fires on every bar]
+        │
+        ▼
+  update _peak_value
+  for each symbol in _peak_price:
+    → check trailing stop (10% from peak)
+    → check hard stop (7% from entry)
+    → check take-profit (25% gain)
+  _handle_crypto(slice)
+    → read funding rate from slice
+    → compare to FUNDING_HI / FUNDING_LO thresholds
+    → place or exit crypto position
+
+
+================================================================================
+SECTION 15 — SEPARATION OF CONCERNS MATRIX
+================================================================================
+
+  Concern                    │ U  │ A  │ PCM│ RG │ EX │ PX │ MON
+  ───────────────────────────┼────┼────┼────┼────┼────┼────┼────
+  Subscribe to data          │ ✓  │    │    │    │    │    │
+  Create/remove indicators   │ ✓  │    │    │    │    │    │
+  Compute alpha scores       │    │ ✓  │    │    │    │    │
+  Read indicator values      │    │ ✓  │    │    │    │    │
+  Normalize / blend scores   │    │ ✓  │    │    │    │    │
+  Select top-N symbols       │    │    │ ✓  │    │    │    │
+  Compute target weights     │    │    │ ✓  │    │    │    │
+  Apply sector/position caps │    │    │ ✓  │    │    │    │
+  Check halt/defensive flags │    │    │    │ ✓  │    │    │
+  Block or reduce weights    │    │    │    │ ✓  │    │    │
+  Place orders               │    │    │    │    │ ✓  │    │
+  Tag orders                 │    │    │    │    │ ✓  │    │
+  Track fills (on_order_evt) │    │    │    │    │ ✓  │    │
+  Run trailing/hard stops    │    │    │    │    │    │ ✓  │
+  Run circuit breaker        │    │    │    │    │    │ ✓  │
+  Set halt/defensive flags   │    │    │    │    │    │ ✓  │
+  Liquidate on halt          │    │    │    │    │    │ ✓  │
+  self.plot() / self.log()   │    │    │    │    │    │    │ ✓
+  notify.email()             │    │    │    │    │    │    │ ✓
+  Read state (audit only)    │    │    │    │    │    │    │ ✓
+
+  U=Universe  A=Alpha  PCM=PortfolioConstruction  RG=RiskGate
+  EX=Execution  PX=PostTradeRisk  MON=Monitoring
+
+
+================================================================================
+SECTION 16 — CONFIGURATION & PARAMETER MANAGEMENT
+================================================================================
+
+ALL PARAMETERS AS CLASS CONSTANTS (top of class, single source of truth):
+```python
+class AMMROAlgorithm(QCAlgorithm):
+
+    # ── Universe ──────────────────────────────────────────────────────────
+    UNIVERSE_SIZE       = 500
+    MIN_PRICE           = 10.0
+    MIN_DOLLAR_VOL      = 10_000_000
+    MIN_MARKET_CAP      = 1_000_000_000
+
+    # ── Alpha ─────────────────────────────────────────────────────────────
+    MOMENTUM_LOOKBACK   = 252    # trading days (~12 months)
+    MOMENTUM_SKIP       = 22     # skip most recent month
+    QUALITY_DE_PENALTY  = 0.1    # debt/equity penalty coefficient
+    RSI_PERIOD          = 14
+    RSI_OVERBOUGHT      = 75
+    RSI_IDEAL_HI        = 65
+    RSI_IDEAL_LO        = 40
+
+    # ── Portfolio Construction ─────────────────────────────────────────────
+    TOP_N               = 25
+    EQUITY_SLEEVE       = 0.85
+    CRYPTO_SLEEVE       = 0.10
+    VOL_LOOKBACK        = 60     # days for realized vol computation
+    POSITION_CAP        = 0.15
+    SECTOR_CAP          = 0.30
+
+    # ── Risk ──────────────────────────────────────────────────────────────
+    HARD_STOP           = 0.93   # 7% loss from entry → liquidate
+    TRAILING_STOP       = 0.90   # 10% drop from peak → liquidate
+    TAKE_PROFIT         = 0.25   # 25% gain → partial exit
+    DEFENSIVE_DD        = 0.08
+    HALT_DD             = 0.12
+    RECOVERY_DD         = 0.05
+    VIX_RECOVERY        = 25.0
+    MARGIN_EMERGENCY    = 0.05   # margin_remaining < 5% → exit crypto
+
+    # ── Crypto ────────────────────────────────────────────────────────────
+    FUNDING_HI          = 0.0001    # 0.01% per 8hr → go SHORT
+    FUNDING_LO          = -0.00005  # -0.005% per 8hr → go LONG
+    FUNDING_MIN_PERIODS = 10
+
+    # ── Weights (alpha blending) ───────────────────────────────────────────
+    W_MOMENTUM          = 0.60
+    W_QUALITY           = 0.30
+    W_RSI               = 0.10
+```
+
+PARAMETER CHANGE DISCIPLINE:
+  - Never hard-code a numeric constant inside a method body
+  - All sensitivity testing done by changing class constants only
+  - Parameter table in design doc (jamlquant_algo_design.txt Section 12)
+    maps each constant to its test range
+
+
+================================================================================
+SECTION 17 — TESTING STRATEGY
+================================================================================
+
+TEST LEVELS:
+
+  LEVEL 1 — UNIT: Test each layer in isolation
+    - Alpha layer: mock self.history → verify score normalization
+    - PCM: given a fixed score dict → verify weights sum, caps applied
+    - Risk gate: given halt_flag=True → verify empty dict returned
+    - Risk math: given drawdown=0.13 → verify halt triggered
+
+  LEVEL 2 — INTEGRATION: Algorithm Framework null model swaps
+    - Swap in NullAlphaModel → verify no orders placed
+    - Swap in NullExecutionModel → verify targets still computed
+    - Force is_warming_up=False early → verify no look-ahead
+
+  LEVEL 3 — BACKTEST: Full system test
+    - In-sample : 2015–2020
+    - Out-of-sample : 2021–2024
+    - Stress periods : COVID crash (Feb–Apr 2020), 2022 bear market
+    - Walk-forward : 6-month rolling windows
+
+  LEVEL 4 — PAPER TRADING: 2 months minimum before live capital
+
+WHAT TO ASSERT IN BACKTESTS:
+  - Halt fires before drawdown exceeds HALT_DD + 2% (slippage buffer)
+  - No position ever exceeds POSITION_CAP + 1%
+  - No sector ever exceeds SECTOR_CAP + 2%
+  - Monthly turnover < 35% on average
+  - Zero trades during is_warming_up period
+
+
+================================================================================
+SECTION 18 — ARCHITECTURE ANTI-PATTERNS (DO NOT DO)
+================================================================================
+
+  ANTI-PATTERN                          │ WHY IT FAILS
+  ──────────────────────────────────────┼───────────────────────────────────────
+  Placing orders inside Alpha layer     │ Alpha runs every bar — duplicate orders
+  Reading portfolio state in PCM        │ Creates circular dependency
+  Computing scores inside on_data       │ Runs on every tick — catastrophic cost
+  Using global variables across methods │ State mutation becomes untraceable
+  try/except with bare pass             │ Silent failures hide bugs
+  Magic numbers inside methods          │ One number change requires grep across
+                                        │ every method body
+  Mutating dict during iteration        │ Runtime error in Python — dict size change
+  Calling history() per symbol in loop  │ O(N) sequential calls — slowest possible
+  Checking is_warming_up in on_order_evt│ Order events still fire during warm-up;
+                                        │ guarding correctly requires tag check
+  Storing DataFrames in class state     │ Memory leak — DataFrames are large
+  Not tagging orders                    │ Impossible to debug fills in log
+
+================================================================================
+END OF ARCHITECTURE DOCUMENT
+================================================================================
+File    : jamlquant_algo_architecture.txt
+Author  : JamlQuant
+Date    : 2026-05-03
+Covers  : Reliability | Latency | Risk Control | Separation of Concerns
+================================================================================

@@ -1,0 +1,829 @@
+================================================================================
+JAMLQUANT ALGORITHMIC TRADING SOLUTION — DESIGN DOCUMENT
+================================================================================
+Strategy Name  : Adaptive Multi-Factor Momentum with Risk Overlay (AMMRO)
+Platform       : QuantConnect / LEAN Engine (Python 3.11)
+Asset Class    : US Equities (primary) + Crypto Futures (satellite)
+Architecture   : Algorithm Framework (modular pipeline)
+Target Sharpe  : > 1.2
+Target Max DD  : < 15%
+Target CAGR    : 18–25% annually
+Rebalance Freq : Monthly (equity core) + Continuous (crypto satellite)
+================================================================================
+
+
+================================================================================
+SECTION 1 — STRATEGY OVERVIEW & INVESTMENT THESIS
+================================================================================
+
+CORE IDEA:
+  Momentum is the most persistent and well-documented factor in equity markets.
+  Stocks that performed well over the past 12 months (excluding the most recent
+  month to avoid short-term reversal) continue to outperform on average.
+
+  This strategy layers three alpha sources:
+    1. Price Momentum  — 12-1 month return ranking (primary signal)
+    2. Quality Filter  — ROE > 15%, low debt (reduces value traps)
+    3. Volatility Trim — Inverse-vol weighting (reduces risk-adjusted drawdown)
+
+  A separate satellite sleeve trades BTC perpetual futures on Binance using a
+  funding-rate mean-reversion signal — generating income from the carry trade
+  when funding rates are elevated and directional positions when rates are low.
+
+  Risk overlay: A portfolio-level drawdown circuit breaker halts ALL new entries
+  when the portfolio drops more than 12% from its peak, preserving capital during
+  regime shifts.
+
+EDGE SOURCES:
+  1. Momentum Premium      — academically documented (Jegadeesh & Titman, 1993)
+  2. Quality Premium       — removes low-quality momentum stocks (Asness, 2014)
+  3. Vol Weighting         — reduces concentration in high-vol/high-beta stocks
+  4. Funding Rate Carry    — crypto perp funding rates revert to mean
+  5. Disciplined Risk Mgmt — avoids catastrophic drawdowns that kill compounding
+
+ACCOUNT SETTINGS:
+  - Starting Capital : $100,000 USD
+  - Broker Model     : Interactive Brokers (equity sleeve)
+                       Binance Futures / Margin (crypto sleeve)
+  - Leverage         : 1.0x equity, up to 2.0x crypto satellite
+  - Benchmark        : SPY (S&P 500)
+
+
+================================================================================
+SECTION 2 — UNIVERSE SELECTION
+================================================================================
+
+EQUITY UNIVERSE FILTER:
+  Source     : QuantConnect Fundamental data (Morningstar)
+  Refresh    : Daily (asynchronous)
+  Max stocks : 500 candidates → 20–30 final portfolio positions
+
+  FILTER CRITERIA:
+    - Price > $10               (avoid penny stocks)
+    - Dollar volume > $10M/day  (sufficient liquidity for slippage control)
+    - Market cap > $1B          (mid/large cap only)
+    - Has fundamental data      (required for quality factors)
+    - Exclude financial sector  (leverage distorts fundamental factors)
+    - Minimum 12 months history (required for momentum calculation)
+
+  CODE SKETCH:
+    def _fundamental_filter(self, fundamental):
+        filtered = [
+            f for f in fundamental
+            if f.has_fundamental_data
+            and f.price > 10
+            and f.dollar_volume > 10_000_000
+            and f.market_cap > 1_000_000_000
+            and f.asset_classification.morningstar_sector_code
+                != MorningstarSectorCode.FINANCIAL_SERVICES
+        ]
+        return [f.symbol for f in sorted(
+            filtered, key=lambda x: x.dollar_volume, reverse=True)[:500]]
+
+CRYPTO UNIVERSE (satellite):
+  Single pair: BTCUSDT perpetual future on Binance
+  - Hardcoded — no universe selection needed
+  - Continuous 24/7 market, no rollover required
+
+
+================================================================================
+SECTION 3 — ALPHA MODEL (SIGNAL GENERATION)
+================================================================================
+
+EQUITY ALPHA — COMPOSITE MOMENTUM+QUALITY SCORE:
+
+  SIGNAL 1: Price Momentum (weight 60%)
+    - Lookback: 252 trading days (12 months)
+    - Skip: Exclude most recent 22 days (1 month) to avoid short-term reversal
+    - Formula: momentum = close[−22] / close[−252] − 1
+    - Rank all stocks by momentum → normalize to [0, 1]
+
+  SIGNAL 2: Quality Factor (weight 30%)
+    - ROE (Return on Equity): fundamentals.operation_ratios.roe.one_year
+    - Debt/Equity: fundamentals.operation_ratios.long_term_debt_equity_ratio.value
+    - Quality Score = ROE − debt_penalty (normalize across universe)
+    - Eliminates stocks with negative ROE or D/E > 2.0
+
+  SIGNAL 3: RSI Timing Filter (weight 10%)
+    - 14-day RSI on daily bars
+    - Avoid entering when RSI > 75 (overbought)
+    - Prefer entering when RSI between 45–65 (confirmed uptrend, not exhausted)
+    - This is a GATE not a ranking factor (binary: pass/fail)
+
+  COMPOSITE SCORE:
+    composite = 0.60 × momentum_rank + 0.30 × quality_rank + 0.10 × rsi_score
+    Select top-N stocks by composite score (target: 20–30 positions)
+
+  INSIGHT GENERATION:
+    - UP insight for top-N stocks, duration = 30 days
+    - FLAT insight for any stock previously in portfolio but now below cutoff
+    - Confidence = normalized composite score (used by portfolio construction)
+    - Magnitude = expected momentum return (momentum / 12 months annualized)
+
+CRYPTO ALPHA — FUNDING RATE MEAN REVERSION:
+  Logic:
+    - When 8-hour funding rate > 0.01% (annualized ~11%): SHORT (rate too high → longs pay)
+    - When funding rate < −0.005% (negative): LONG (shorts paying premiums)
+    - When funding rate near zero (−0.005% to 0.01%): FLAT (no carry edge)
+  Secondary confirmation:
+    - Only enter directional positions with funding rate signal if
+      10-period price momentum aligns with direction
+  Position size: Fixed 10% of total portfolio value in crypto sleeve
+
+
+================================================================================
+SECTION 4 — PORTFOLIO CONSTRUCTION
+================================================================================
+
+EQUITY SLEEVE (85% of portfolio):
+
+  METHOD: Inverse-Volatility Weighted (among top-N selected stocks)
+
+  STEPS:
+    1. For each selected stock, compute 60-day realized volatility from daily returns
+    2. Weight = 1 / vol (inverse-vol gives more weight to stable stocks)
+    3. Normalize weights to sum to 85% of portfolio
+    4. Cap each position at 15% (concentration limit)
+    5. Enforce minimum position of 1% (avoid tiny dust positions)
+
+  REBALANCE TRIGGER:
+    - Scheduled: First trading day of each month, 30 min after market open
+    - Ad-hoc: If any position drifts > 3% from target weight
+    - Full rebalance with liquidate_existing_holdings=True
+
+  SECTOR CONSTRAINTS:
+    - Max 30% in any single Morningstar sector
+    - If sector would exceed limit, trim lowest-score stocks in that sector
+
+CRYPTO SATELLITE SLEEVE (max 15% of portfolio):
+  - Fixed 10% weight when signal is active (funded + directional confirmation)
+  - Scale to 0% when halted by risk model
+  - Use margin account; maintain 5% free portfolio buffer for margin safety
+
+CASH MANAGEMENT:
+  - Minimum 5% portfolio cash reserve at all times (free_portfolio_value_percentage)
+  - Cash reserve increases to 20% when portfolio drawdown > 8% (defensive mode)
+  - Cash reserve increases to 100% (full exit) when drawdown > 12%
+
+
+================================================================================
+SECTION 5 — RISK MANAGEMENT FRAMEWORK
+================================================================================
+
+LAYER 1 — Per-Security Stop Loss (always active):
+  - Hard stop: Liquidate if unrealized loss > 7% from cost basis
+  - Trailing stop: Track peak price; liquidate if price drops 10% from peak
+  - Take profit: Partial exit (50%) if position up > 25%
+  - Triggered in on_data and in custom RiskManagementModel
+
+LAYER 2 — Portfolio Drawdown Circuit Breaker:
+  - Track peak portfolio value
+  - Defensive Mode: drawdown > 8% → stop new entries, increase cash to 20%
+  - Halt Mode: drawdown > 12% → liquidate all positions, 100% cash
+  - Recovery: Resume when portfolio recovers to within 5% of peak AND
+              VIX < 25 (regime normalization signal)
+
+LAYER 3 — Position Concentration Limits:
+  - Max 15% per single position (cap during portfolio construction)
+  - Max 30% per Morningstar sector
+  - Max 15% in crypto satellite sleeve
+
+LAYER 4 — Margin Monitoring (critical for crypto sleeve):
+  - If margin_remaining < 10% of portfolio → reduce crypto position by 50%
+  - If margin_remaining < 5% → fully exit crypto sleeve
+
+LAYER 5 — Volatility Regime Filter:
+  - Compute 20-day realized vol of SPY (equity market regime proxy)
+  - If SPY vol > 30% annualized → reduce all positions to 50% of target weight
+  - If SPY vol > 40% → defensive mode (cash only)
+  - VIX index data via: self.add_index("VIX")
+
+RISK MODEL STACK (Framework):
+  self.add_risk_management(MaximumDrawdownPercentPerSecurity(0.07))
+  self.add_risk_management(MaximumDrawdownPercentPortfolio(0.12))
+  self.add_risk_management(TrailingStopRiskManagementModel(0.10))
+  self.add_risk_management(MyCustomRiskModel())   # concentration + vol regime
+
+
+================================================================================
+SECTION 6 — ORDER MANAGEMENT
+================================================================================
+
+ORDER TYPE SELECTION:
+  - Equity rebalance entries/exits : Market-on-Open (MOO)
+      → Fills at official open print; avoids intraday noise
+      → Placed the day BEFORE the rebalance date at market close
+  - Intraday stop losses           : Stop Market orders
+      → Immediate execution on breach; acceptable slippage for protection
+  - Limit adjustments (mid-month)  : Limit orders at mid-point of bid/ask
+      → Placed with 1-hour time-in-force; cancel if unfilled
+  - Crypto entries/exits           : Limit orders at best bid/ask
+      → Binance has tight spreads; limit orders fill quickly
+  - Crypto stop losses             : Stop Market orders
+      → 24/7 market — must handle at-market for crypto
+
+ORDER FLOW:
+  On rebalance day (monthly):
+    1. Calculate new target weights (portfolio construction)
+    2. Identify stocks to EXIT (no longer in top-N) → MOO sell orders
+    3. Wait for fills (on_order_event confirmation)
+    4. Place MOO BUY orders for new positions
+    5. Place limit orders for weight adjustments on existing positions
+
+  Tags (always tag orders for debugging):
+    - "entry-momentum-{symbol}"
+    - "exit-rotation"
+    - "stop-loss-7pct"
+    - "trailing-stop"
+    - "take-profit-25pct"
+    - "rebalance-monthly"
+    - "crypto-funding-entry"
+    - "margin-reduction"
+
+ORDER EVENT HANDLING:
+  def on_order_event(self, order_event):
+    if order_event.status == OrderStatus.FILLED:
+        if "entry" in order_event.tag:
+            self._entry_time[order_event.symbol] = self.time
+            self._entry_price[order_event.symbol] = order_event.fill_price
+            self._peak_price[order_event.symbol] = order_event.fill_price
+        elif "exit" in order_event.tag or "stop" in order_event.tag:
+            self._entry_time.pop(order_event.symbol, None)
+            self._entry_price.pop(order_event.symbol, None)
+            self._peak_price.pop(order_event.symbol, None)
+
+    elif order_event.status == OrderStatus.INVALID:
+        self.log(f"INVALID ORDER: {order_event.symbol} — {order_event.message}")
+
+    elif order_event.status == OrderStatus.CANCELED:
+        ticket = self.transactions.get_order_ticket(order_event.order_id)
+        if ticket and "limit-adjust" in (ticket.tag or ""):
+            # Retry as market order if limit failed after timeout
+            self.market_order(order_event.symbol,
+                ticket.quantity - ticket.quantity_filled,
+                tag="retry-market")
+
+
+================================================================================
+SECTION 7 — EXECUTION STRATEGY
+================================================================================
+
+EQUITY EXECUTION:
+  Model: VolumeWeightedAveragePriceExecutionModel
+    → Slices large orders over the trading day to minimize market impact
+    → Suitable for monthly rebalances where urgency is low
+  Fallback: ImmediateExecutionModel for stop-loss exits (speed over price)
+
+SLIPPAGE ASSUMPTIONS:
+  - Liquid mid/large cap: 5–10 bps per trade (modeled with SpreadSlippageModel)
+  - Fee model: InteractiveBrokers ($0.005/share, min $1 per order)
+  - Turnover target: < 30% monthly (reduces fee drag)
+
+CRYPTO EXECUTION:
+  - Binance USDT perpetual: very liquid, 0.04% maker / 0.04% taker
+  - Use limit orders at mid-price → expect fills within 1 minute
+  - If limit not filled in 5 minutes: cancel and replace at new mid-price
+  - Execution model: Custom LimitOrderExecution (see code skeleton below)
+
+AVOIDING SLIPPAGE TRAPS:
+  - Never trade in first 5 minutes of equity session (volatile spreads)
+  - Use after_market_open("SPY", 30) for all scheduled entries
+  - Check bid/ask spread before placing; skip if spread > 0.5% of price
+  - For crypto: check is_market_open() before market orders
+
+
+================================================================================
+SECTION 8 — DATA & INFRASTRUCTURE
+================================================================================
+
+DATA SUBSCRIPTIONS:
+  Equity Core:
+    - universe_settings.resolution = Resolution.DAILY
+    - Individual stock data: auto-subscribed via universe
+    - SPY (benchmark + vol regime): Resolution.DAILY
+    - VIX (risk regime): self.add_index("VIX", Resolution.DAILY)
+
+  Crypto Satellite:
+    - self.add_crypto_future("BTCUSDT", Resolution.DAILY, Market.BINANCE)
+    - MarginInterestRate dataset auto-included with add_crypto_future
+
+  Alternative Data (optional, for enhanced alpha):
+    - Brain Sentiment data: trade around earnings surprise signals
+    - Smart Insider dataset: reduce allocation when insiders are selling
+
+WARM-UP REQUIREMENTS:
+  - Momentum signal: 252 + 22 = 274 bars minimum
+  - Volatility weighting: 60 bars
+  - RSI indicator: 14 bars
+  - SPY vol regime: 20 bars
+  - Funding rate min indicator: 10 bars (for crypto min-rate tracking)
+  - Set warm-up: self.set_warm_up(280, Resolution.DAILY)
+
+INDICATORS (auto-managed per security):
+  Per equity in universe:
+    - RSI(14, Resolution.DAILY) — timing gate
+    - ATR(14, Resolution.DAILY) — position sizing / stop placement
+    - SMA(200, Resolution.DAILY) — trend regime filter (optional)
+  Portfolio level:
+    - SPY 20-day realized vol (manually computed in on_data)
+    - VIX close level (via index data)
+  Crypto:
+    - Minimum(10) on funding rate — track 10-period low rate
+
+
+================================================================================
+SECTION 9 — MONITORING & LOGGING
+================================================================================
+
+SCHEDULED LOGS (every rebalance):
+  self.log(f"=== MONTHLY REBALANCE {self.time.strftime('%Y-%m')} ===")
+  self.log(f"Portfolio Value : ${self.portfolio.total_portfolio_value:,.0f}")
+  self.log(f"Cash Pct        : {self.portfolio.cash/self.portfolio.total_portfolio_value:.1%}")
+  self.log(f"Positions       : {sum(1 for h in self.portfolio.values() if h.invested)}")
+  self.log(f"Margin Left     : ${self.portfolio.margin_remaining:,.0f}")
+  self.log(f"Peak Value      : ${self._peak_value:,.0f}")
+  drawdown = (self._peak_value - self.portfolio.total_portfolio_value) / self._peak_value
+  self.log(f"Current Drawdown: {drawdown:.1%}")
+
+CUSTOM CHARTS:
+  self.plot("Risk", "DrawdownPct", drawdown * 100)
+  self.plot("Risk", "CashPct", cash_pct * 100)
+  self.plot("Alpha", "ActivePositions", n_positions)
+  self.plot("Crypto", "FundingRate", interest_rate * 10000)   # in bps
+
+LIVE NOTIFICATIONS (deploy phase):
+  self.notify.email("jamlechmukavana9@gmail.com",
+      "AMMRO Alert",
+      f"Drawdown alert: {drawdown:.1%} at {self.time}")
+
+
+================================================================================
+SECTION 10 — PERFORMANCE TARGETS & ACCEPTANCE CRITERIA
+================================================================================
+
+BACKTEST ACCEPTANCE CRITERIA (must pass all before live deployment):
+  [ ] Sharpe Ratio     ≥ 1.2    (risk-adjusted return)
+  [ ] Sortino Ratio    ≥ 1.5    (downside-adjusted)
+  [ ] CAGR             ≥ 15%    (absolute compound growth)
+  [ ] Max Drawdown     ≤ 15%    (peak-to-trough)
+  [ ] Win Rate         ≥ 52%    (% of profitable monthly periods)
+  [ ] Profit Factor    ≥ 1.5    (avg win / avg loss)
+  [ ] Calmar Ratio     ≥ 1.0    (CAGR / Max DD)
+  [ ] Alpha vs SPY     > 5%     (excess annual return)
+  [ ] Beta vs SPY      < 0.7    (lower market correlation than passive)
+  [ ] Avg Monthly Turn < 30%    (cost efficiency)
+
+BACKTEST VALIDATION PROTOCOL:
+  Step 1: In-sample backtest:   Jan 2015 – Dec 2020 (parameter fitting)
+  Step 2: Out-of-sample test:   Jan 2021 – Dec 2023 (true holdout)
+  Step 3: Walk-forward:         6-month rolling windows across full period
+  Step 4: Stress test periods:
+            - COVID crash (Feb–Mar 2020)
+            - 2022 bear market (Jan–Oct 2022)
+            - 2018 Q4 selloff
+  Step 5: Parameter sensitivity: Test ±20% variation in key params
+            (momentum lookback, top-N stocks, stop-loss %)
+  Step 6: Paper trade 2 months before live capital deployment
+
+
+================================================================================
+SECTION 11 — FULL PYTHON CODE SKELETON
+================================================================================
+
+from AlgorithmImports import *
+import numpy as np
+
+# ─────────────────────────────────────────────────────────────────────────────
+class AMMROAlgorithm(QCAlgorithm):
+    """
+    Adaptive Multi-Factor Momentum with Risk Overlay (AMMRO)
+    Equity momentum + crypto funding carry + vol-regime risk overlay.
+    """
+
+    def initialize(self) -> None:
+        # ── Date range ──────────────────────────────────────────────────────
+        self.set_start_date(2015, 1, 1)
+        self.set_end_date(2024, 12, 31)
+        self.set_cash(100_000)
+
+        # ── Reality modeling ─────────────────────────────────────────────────
+        self.set_brokerage_model(BrokerageModel.INTERACTIVE_BROKERS_BROKERAGE,
+                                 AccountType.MARGIN)
+        self.settings.free_portfolio_value_percentage = 0.05
+        self.set_benchmark("SPY")
+
+        # ── Universe ─────────────────────────────────────────────────────────
+        self.universe_settings.resolution   = Resolution.DAILY
+        self.universe_settings.asynchronous = True
+        self._universe = self.add_universe(self._fundamental_filter)
+
+        # ── Regime instruments ───────────────────────────────────────────────
+        self._spy = self.add_equity("SPY", Resolution.DAILY).symbol
+        self._vix = self.add_index("VIX", Resolution.DAILY).symbol
+
+        # ── Crypto satellite ─────────────────────────────────────────────────
+        btc_future          = self.add_crypto_future(
+            "BTCUSDT", Resolution.DAILY, Market.BINANCE)
+        self._btc           = btc_future.symbol
+        self._btc_lot_size  = btc_future.symbol_properties.lot_size
+        self._funding_min   = Minimum(10)   # track 10-period low funding rate
+
+        # ── Per-security dicts ───────────────────────────────────────────────
+        self._rsi        = {}   # RSI indicators
+        self._atr        = {}   # ATR indicators
+        self._entry_price = {}  # entry price per symbol
+        self._peak_price  = {}  # peak price per symbol (for trailing stop)
+        self._entry_time  = {}  # entry datetime per symbol
+
+        # ── Portfolio risk state ─────────────────────────────────────────────
+        self._peak_value      = self.portfolio.total_portfolio_value
+        self._trading_halted  = False
+        self._defensive_mode  = False
+
+        # ── Warm-up ──────────────────────────────────────────────────────────
+        self.set_warm_up(280, Resolution.DAILY)
+
+        # ── Schedules ────────────────────────────────────────────────────────
+        # Monthly rebalance: first trading day, 30 min after open
+        self.schedule.on(
+            self.date_rules.month_start(self._spy),
+            self.time_rules.after_market_open(self._spy, 30),
+            self._monthly_rebalance)
+
+        # Daily risk check: 15 min after open
+        self.schedule.on(
+            self.date_rules.every_day(self._spy),
+            self.time_rules.after_market_open(self._spy, 15),
+            self._daily_risk_check)
+
+        # Daily log at market close
+        self.schedule.on(
+            self.date_rules.every_day(self._spy),
+            self.time_rules.before_market_close(self._spy, 5),
+            self._log_state)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # UNIVERSE FILTER
+    # ─────────────────────────────────────────────────────────────────────────
+    def _fundamental_filter(self, fundamental: List[Fundamental]) -> List[Symbol]:
+        filtered = [
+            f for f in fundamental
+            if f.has_fundamental_data
+            and f.price > 10
+            and f.dollar_volume > 10_000_000
+            and f.market_cap > 1_000_000_000
+            and f.asset_classification.morningstar_sector_code
+                != MorningstarSectorCode.FINANCIAL_SERVICES
+        ]
+        return [f.symbol for f in sorted(
+            filtered, key=lambda x: x.dollar_volume, reverse=True)[:500]]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SECURITIES CHANGED — set up / tear down per-security state
+    # ─────────────────────────────────────────────────────────────────────────
+    def on_securities_changed(self, changes: SecurityChanges) -> None:
+        for added in changes.added_securities:
+            s = added.symbol
+            if s.security_type == SecurityType.EQUITY:
+                self._rsi[s] = self.rsi(s, 14, Resolution.DAILY)
+                self._atr[s] = self.atr(s, 14, Resolution.DAILY)
+
+        for removed in changes.removed_securities:
+            s = removed.symbol
+            if s in self._rsi:
+                self.deregister_indicator(self._rsi.pop(s))
+            if s in self._atr:
+                self.deregister_indicator(self._atr.pop(s))
+            # Liquidate if still invested
+            if self.portfolio[s].invested:
+                self.liquidate(s, tag="exit-universe-removal")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # on_data — real-time crypto handling + trailing stops
+    # ─────────────────────────────────────────────────────────────────────────
+    def on_data(self, slice: Slice) -> None:
+        if self.is_warming_up: return
+
+        # ── Update peak portfolio value ───────────────────────────────────────
+        self._peak_value = max(self._peak_value,
+                               self.portfolio.total_portfolio_value)
+
+        # ── Per-position trailing stops (equity) ──────────────────────────────
+        for symbol, peak in list(self._peak_price.items()):
+            if not self.portfolio[symbol].invested:
+                continue
+            current = self.securities[symbol].price
+            self._peak_price[symbol] = max(peak, current)
+            # 10% trailing stop from peak
+            if current < self._peak_price[symbol] * 0.90:
+                self.liquidate(symbol, tag="trailing-stop")
+            # 7% hard stop from entry
+            elif current < self._entry_price.get(symbol, current) * 0.93:
+                self.liquidate(symbol, tag="stop-loss-7pct")
+            # 25% take-profit (partial exit)
+            elif (self.portfolio[symbol].unrealized_profit_percent > 0.25
+                  and not getattr(self, f"_tp_taken_{symbol}", False)):
+                self.set_holdings(symbol,
+                    self.portfolio[symbol].holdings_value
+                    / self.portfolio.total_portfolio_value * 0.5,
+                    tag="take-profit-25pct")
+                setattr(self, f"_tp_taken_{symbol}", True)
+
+        # ── Crypto satellite logic ────────────────────────────────────────────
+        self._handle_crypto(slice)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # CRYPTO SATELLITE
+    # ─────────────────────────────────────────────────────────────────────────
+    def _handle_crypto(self, slice: Slice) -> None:
+        if self._trading_halted: return
+        if not self.is_market_open(self._btc): return
+
+        margin_rate = slice.margin_interest_rates.get(self._btc)
+        if not margin_rate: return
+
+        rate = margin_rate.interest_rate
+        self._funding_min.update(self.time, rate)
+
+        btc_weight = (self.portfolio[self._btc].holdings_value
+                      / self.portfolio.total_portfolio_value)
+
+        # High funding: shorts pay longs → go SHORT (collect carry)
+        if rate > 0.0001 and not self.portfolio[self._btc].is_short:
+            self._place_crypto_order(-0.10)
+
+        # Negative funding: longs pay → go LONG (or exit short)
+        elif rate < -0.00005 and not self.portfolio[self._btc].is_long:
+            self._place_crypto_order(0.10)
+
+        # Neutral zone → exit crypto
+        elif -0.00005 <= rate <= 0.0001 and self.portfolio[self._btc].invested:
+            self.liquidate(self._btc, tag="crypto-funding-neutral")
+
+    def _place_crypto_order(self, target_weight: float) -> None:
+        target_value = self.portfolio.total_portfolio_value * abs(target_weight)
+        price        = self.securities[self._btc].price
+        quantity     = target_value / price
+        quantity     = quantity // self._btc_lot_size * self._btc_lot_size
+        if abs(quantity) < self._btc_lot_size: return
+        signed_qty   = quantity if target_weight > 0 else -quantity
+        self.market_order(self._btc, signed_qty, tag="crypto-funding-entry")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # MONTHLY REBALANCE
+    # ─────────────────────────────────────────────────────────────────────────
+    def _monthly_rebalance(self) -> None:
+        if self.is_warming_up: return
+        if self._trading_halted:
+            self.log("Rebalance SKIPPED — trading halted (drawdown protection)")
+            return
+
+        self.log(f"=== MONTHLY REBALANCE {self.time.strftime('%Y-%m')} ===")
+
+        # ── Compute composite scores ──────────────────────────────────────────
+        scores = self._compute_scores()
+        if not scores:
+            self.log("No valid scores computed — skipping rebalance")
+            return
+
+        # ── Select top 25 stocks ──────────────────────────────────────────────
+        sorted_symbols = sorted(scores, key=scores.get, reverse=True)
+        top_n = min(25, len(sorted_symbols))
+        selected = sorted_symbols[:top_n]
+
+        # ── Compute target weights (inverse-vol) ──────────────────────────────
+        vols = {}
+        for symbol in selected:
+            hist = list(self.history[TradeBar](symbol, 63, Resolution.DAILY))
+            if len(hist) < 10: continue
+            rets = [hist[i].close / hist[i-1].close - 1 for i in range(1, len(hist))]
+            vols[symbol] = np.std(rets) if rets else 1.0
+
+        inv_vol_sum = sum(1.0 / v for v in vols.values() if v > 0)
+        raw_weights = {
+            s: (1.0 / vols[s]) / inv_vol_sum * 0.85   # 85% in equity sleeve
+            for s in vols if vols[s] > 0}
+
+        # ── Apply concentration caps ──────────────────────────────────────────
+        weights = {s: min(w, 0.15) for s, w in raw_weights.items()}
+
+        # ── Defensive mode: halve positions ──────────────────────────────────
+        if self._defensive_mode:
+            weights = {s: w * 0.5 for s, w in weights.items()}
+
+        # ── Build targets and rebalance ───────────────────────────────────────
+        targets = [PortfolioTarget(s, w) for s, w in weights.items()]
+        self.set_holdings(targets, liquidate_existing_holdings=True,
+                          tag="rebalance-monthly")
+
+        # Record entry metadata for new positions
+        for symbol in weights:
+            if not self.portfolio[symbol].invested:
+                self._entry_price[symbol] = self.securities[symbol].price
+                self._peak_price[symbol]  = self.securities[symbol].price
+                self._entry_time[symbol]  = self.time
+
+    def _compute_scores(self) -> dict:
+        scores = {}
+        momentum_raw = {}
+        quality_raw  = {}
+
+        for symbol in self.active_securities.keys():
+            if symbol.security_type != SecurityType.EQUITY: continue
+            security = self.securities[symbol]
+            if not security.fundamentals: continue
+
+            # Momentum: 12-1 month return
+            hist = list(self.history[TradeBar](symbol, 280, Resolution.DAILY))
+            if len(hist) < 252: continue
+            momentum = hist[-22].close / hist[0].close - 1
+            momentum_raw[symbol] = momentum
+
+            # Quality: ROE - debt penalty
+            try:
+                roe   = security.fundamentals.operation_ratios.roe.one_year or 0
+                de    = security.fundamentals.operation_ratios.long_term_debt_equity_ratio.value or 0
+                quality_raw[symbol] = roe - max(0, de - 1.0) * 0.1
+            except:
+                quality_raw[symbol] = 0.0
+
+            # RSI timing gate (soft filter — lower score if overbought)
+            rsi_indicator = self._rsi.get(symbol)
+            if rsi_indicator and rsi_indicator.is_ready:
+                rsi = rsi_indicator.current.value
+                rsi_score = 1.0 if 40 <= rsi <= 65 else (0.5 if rsi < 40 else 0.0)
+            else:
+                rsi_score = 0.5   # neutral if no data
+
+            scores[symbol] = (momentum_raw[symbol], quality_raw.get(symbol, 0), rsi_score)
+
+        if not scores: return {}
+
+        # Normalize momentum and quality to [0, 1]
+        m_values = [v[0] for v in scores.values()]
+        q_values = [v[1] for v in scores.values()]
+        m_min, m_max = min(m_values), max(m_values)
+        q_min, q_max = min(q_values), max(q_values)
+        m_range = m_max - m_min if m_max != m_min else 1.0
+        q_range = q_max - q_min if q_max != q_min else 1.0
+
+        composite = {}
+        for symbol, (m, q, r) in scores.items():
+            m_norm = (m - m_min) / m_range
+            q_norm = (q - q_min) / q_range
+            composite[symbol] = 0.60 * m_norm + 0.30 * q_norm + 0.10 * r
+
+        return composite
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # DAILY RISK CHECK
+    # ─────────────────────────────────────────────────────────────────────────
+    def _daily_risk_check(self) -> None:
+        if self.is_warming_up: return
+
+        total = self.portfolio.total_portfolio_value
+        drawdown = (self._peak_value - total) / self._peak_value if self._peak_value > 0 else 0
+
+        # ── Halt mode ────────────────────────────────────────────────────────
+        if drawdown >= 0.12 and not self._trading_halted:
+            self.liquidate(tag="drawdown-halt-12pct")
+            self._trading_halted = True
+            self._defensive_mode = False
+            self.log(f"!!! TRADING HALTED — drawdown {drawdown:.1%} breached 12% !!!")
+            self.notify.email("jamlechmukavana9@gmail.com",
+                "AMMRO: Trading Halted",
+                f"Portfolio drawdown {drawdown:.1%} exceeded 12% threshold at {self.time}. "
+                f"All positions liquidated. Manual review required.")
+
+        # ── Defensive mode ────────────────────────────────────────────────────
+        elif drawdown >= 0.08 and not self._defensive_mode and not self._trading_halted:
+            self._defensive_mode = True
+            self.log(f"DEFENSIVE MODE — drawdown {drawdown:.1%} exceeded 8%")
+
+        # ── Recovery ─────────────────────────────────────────────────────────
+        elif self._trading_halted and drawdown < 0.05:
+            vix_bar = self.history[TradeBar](self._vix, 1, Resolution.DAILY)
+            vix_level = list(vix_bar)[-1].close if vix_bar else 30
+            if vix_level < 25:
+                self._trading_halted = False
+                self._peak_value = total   # reset peak after halt recovery
+                self.log(f"Trading RESUMED — drawdown {drawdown:.1%}, VIX {vix_level:.1f}")
+
+        elif self._defensive_mode and drawdown < 0.05:
+            self._defensive_mode = False
+            self.log(f"Defensive mode LIFTED — drawdown {drawdown:.1%}")
+
+        # ── Margin monitoring ─────────────────────────────────────────────────
+        margin_pct = self.portfolio.margin_remaining / total if total > 0 else 1.0
+        if margin_pct < 0.05 and self.portfolio[self._btc].invested:
+            self.liquidate(self._btc, tag="margin-reduction")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ORDER EVENTS
+    # ─────────────────────────────────────────────────────────────────────────
+    def on_order_event(self, order_event: OrderEvent) -> None:
+        if order_event.status == OrderStatus.FILLED:
+            symbol = order_event.symbol
+            tag    = order_event.tag or ""
+            self.log(f"FILL [{tag}] {symbol}: qty={order_event.fill_quantity:+.4f} "
+                     f"@ {order_event.fill_price:.4f}, fee={order_event.order_fee}")
+
+            if "entry" in tag or "rebalance" in tag:
+                if symbol not in self._entry_price:
+                    self._entry_price[symbol] = order_event.fill_price
+                    self._peak_price[symbol]  = order_event.fill_price
+                    self._entry_time[symbol]  = self.time
+
+            if "stop" in tag or "exit" in tag or "halt" in tag:
+                self._entry_price.pop(symbol, None)
+                self._peak_price.pop(symbol, None)
+                self._entry_time.pop(symbol, None)
+
+        elif order_event.status == OrderStatus.INVALID:
+            self.log(f"INVALID ORDER: {order_event.symbol} — {order_event.message}")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # LOGGING
+    # ─────────────────────────────────────────────────────────────────────────
+    def _log_state(self) -> None:
+        total    = self.portfolio.total_portfolio_value
+        cash_pct = self.portfolio.cash / total if total > 0 else 0
+        drawdown = (self._peak_value - total) / self._peak_value if self._peak_value > 0 else 0
+        n_pos    = sum(1 for h in self.portfolio.values() if h.invested)
+        self.plot("Risk", "DrawdownPct", drawdown * 100)
+        self.plot("Risk", "CashPct",     cash_pct * 100)
+        self.plot("Alpha", "Positions",  n_pos)
+
+
+================================================================================
+SECTION 12 — PARAMETER SENSITIVITY TABLE
+================================================================================
+
+  Parameter               | Base Value | Test Range     | Impact if Changed
+  ------------------------|------------|----------------|--------------------------
+  Momentum lookback       | 252 days   | 126–504        | Lower = more turnover
+  Momentum skip (recent)  | 22 days    | 0–44           | 0 = include reversal
+  Top-N stocks            | 25         | 10–50          | Lower = concentrated
+  Volatility lookback     | 60 days    | 20–120         | Affects weight stability
+  Hard stop loss          | 7%         | 5–12%          | Tighter = more whipsaws
+  Trailing stop           | 10%        | 7–15%          | Tighter = exits trends early
+  Take profit             | 25%        | 15–40%         | Lower = caps winners
+  Defensive drawdown      | 8%         | 5–12%          | Lower = more conservative
+  Halt drawdown           | 12%        | 10–20%         | Lower = more conservative
+  Sector cap              | 30%        | 20–40%         | Affects diversification
+  Position cap            | 15%        | 10–25%         | Affects concentration
+  Crypto funding lo       | -0.005%    | -0.01% to 0%   | Wider = fewer trades
+  Crypto funding hi       | +0.01%     | +0.005% to 0.02%| Wider = fewer trades
+
+
+================================================================================
+SECTION 13 — DEPLOYMENT CHECKLIST
+================================================================================
+
+PRE-DEPLOYMENT:
+  [ ] In-sample backtest passes all acceptance criteria (Section 10)
+  [ ] Out-of-sample backtest on Jan 2021 – present passes criteria
+  [ ] Walk-forward validation completed
+  [ ] All corporate action handlers tested (splits, dividends, delistings)
+  [ ] Order event handler tested (fills, cancels, invalids)
+  [ ] Crypto margin handling tested (lot size, is_market_open, account currency)
+  [ ] Drawdown halt tested in backtest with simulated crash period
+  [ ] Email notification tested in paper trading
+  [ ] Paper trading run: minimum 2 months, live performance matches backtest
+  [ ] Parameter sensitivity analysis: strategy robust to ±20% param changes
+  [ ] Code reviewed for look-ahead bias (no future data in signals)
+  [ ] Slippage and fee model matches actual broker (IB + Binance)
+
+LIVE TRADING:
+  [ ] Set live brokerage credentials in QuantConnect Cloud
+  [ ] Start with 50% of intended capital (scale up after 3 months)
+  [ ] Monitor daily: drawdown, margin, open orders
+  [ ] Set calendar reminder to review performance monthly
+  [ ] Keep detailed trade log (symbol, entry, exit, reason, P&L)
+
+
+================================================================================
+SECTION 14 — KNOWN RISKS & MITIGATIONS
+================================================================================
+
+  Risk                          | Mitigation
+  ------------------------------|--------------------------------------------------
+  Momentum crash (crowding)     | RSI gate avoids overbought entries; 7% stop loss
+  Crypto flash crash            | is_market_open gate; stop market orders; 10% cap
+  Funding rate spike (crypto)   | Position sized at 10%; margin monitoring at 5%
+  Universe survivorship bias    | QuantConnect includes delisted stocks in backtest
+  Overfitting to backtest       | Out-of-sample + walk-forward validation required
+  High turnover cost            | Monthly rebalance only; 30% turnover target
+  Regime change (bear market)   | 8% defensive + 12% halt circuit breakers
+  Correlated positions          | Sector cap 30%; inverse-vol weighting
+  Technical failure (live)      | Email notifications; daily log review
+  Look-ahead bias               | LEAN Time Frontier prevents; use is_warming_up gate
+
+
+================================================================================
+END OF DESIGN DOCUMENT
+================================================================================
+File: jamlquant_algo_design.txt
+Author: JamlQuant (generated with Claude Code + QuantConnect notes)
+Date: 2026-05-03
+================================================================================
